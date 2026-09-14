@@ -1,0 +1,21 @@
+services:
+  supaaction:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: supaaction
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "3000:3000"
+    volumes:
+      - supaaction-data:/data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  supaaction-data:
+    name: supaaction-data

@@ -1,0 +1,116 @@
+# SupaAction
+
+منصة شخصية مفتوحة المصدر تعمل محليًا داخل Docker لإدارة نشاط مشاريع Supabase. تربط حساباتك باستخدام Personal Access Token، تكتشف المشاريع تلقائيًا، ثم تنفذ استعلامًا خفيفًا وآمنًا (`select 1`) لكل مشروع وفق جدول قابل للتخصيص.
+
+## المزايا
+
+- اكتشاف كل المشاريع المتاحة لكل حساب تلقائيًا عبر Supabase Management API.
+- تنشيط افتراضي كل 72 ساعة، مع إمكانية ضبط المدة من الواجهة.
+- استمرار بقية المشاريع عند فشل مشروع واحد.
+- Retry تدريجي لأخطاء الشبكة و`429` و`5xx`.
+- سجل كامل للنتائج، زمن الاستجابة، HTTP status وعدد المحاولات.
+- تشغيل الطلبات بتوازٍ محدود قابل للضبط.
+- تشفير التوكنات داخل SQLite باستخدام AES-256-GCM.
+- جلسة إدارة محمية بكلمة مرور وCookie من نوع `HttpOnly`.
+- مزامنة دورية لاكتشاف المشاريع الجديدة.
+- Dark mode وواجهة عربية RTL مبنية على shadcn/ui وبنية shadcn dashboard.
+- Docker image يعمل بصلاحيات مستخدم غير root مع health check.
+
+## كيف يعمل؟
+
+لا يحتاج SupaAction إلى `anon key` أو `service_role` ولا يقرأ أي جدول من بيانات مشروعك. يستخدم endpoint القراءة فقط في Management API لتشغيل:
+
+```sql
+select 1 as supaaction_ping;
+```
+
+لكل مشروع مفعّل. هذا استعلام قاعدة بيانات حقيقي وخفيف. endpoint ما زال معلّمًا Beta لدى Supabase، لذلك تظهر الأخطاء بوضوح في السجل لو تغير سلوكه مستقبلًا.
+
+## التشغيل باستخدام Docker Compose
+
+المتطلبات: Docker وDocker Compose.
+
+```bash
+git clone https://github.com/h93lab/supaaction.git
+cd supaaction
+cp .env.example .env
+npm run generate-secrets
+```
+
+انسخ قيمتي `SESSION_SECRET` و`ENCRYPTION_KEY` الناتجتين إلى `.env`، ثم ضع كلمة مرور قوية في `APP_PASSWORD` واضبط `APP_URL` إذا كنت ستدخل من عنوان مختلف.
+
+```bash
+docker compose up -d --build
+docker compose ps
+```
+
+افتح `http://localhost:3000` وسجل الدخول باستخدام `APP_PASSWORD`.
+
+## إنشاء Supabase Access Token
+
+من [صفحة Access Tokens](https://supabase.com/dashboard/account/tokens) أنشئ توكنًا جديدًا. إذا كانت Scoped Tokens متاحة في حسابك، امنحه فقط:
+
+- Projects: Read
+- Database: Read
+
+التوكن التقليدي Classic يعمل أيضًا، لكنه يملك نطاقًا أوسع؛ استخدم Scoped Token متى كان متاحًا. عند إضافة الحساب يتحقق SupaAction من التوكن أولًا، ثم يخزنه مشفرًا ولا يعرضه مرة أخرى.
+
+## النسخ الاحتياطي والاستعادة
+
+كل البيانات موجودة في Docker volume باسم `supaaction-data`. لإنشاء نسخة احتياطية متسقة، أوقف الحاوية مؤقتًا ثم انسخ قاعدة البيانات:
+
+```bash
+docker compose stop supaaction
+docker run --rm -v supaaction-data:/data -v "$PWD":/backup busybox cp /data/supaaction.db /backup/supaaction-backup.db
+docker compose start supaaction
+```
+
+احتفظ أيضًا بقيمة `ENCRYPTION_KEY` بأمان؛ بدونها لا يمكن فك تشفير التوكنات الموجودة في النسخة الاحتياطية.
+
+## التحديث
+
+```bash
+git pull
+docker compose up -d --build
+```
+
+SQLite migrations تُنفذ تلقائيًا عند بدء التشغيل، والـ volume لا يُحذف بإعادة البناء.
+
+## التشغيل للتطوير
+
+```bash
+npm install
+cp .env.example .env.local
+npm run dev
+```
+
+في وضع التطوير فقط توجد قيم fallback للأسرار لتسهيل التشغيل المحلي. لا توجد أي قيم fallback عندما يكون `NODE_ENV=production`.
+
+الفحوص المتاحة:
+
+```bash
+npm run check
+```
+
+## متغيرات البيئة
+
+| المتغير | مطلوب | الوصف |
+|---|---:|---|
+| `APP_PASSWORD` | نعم | كلمة مرور لوحة الإدارة |
+| `SESSION_SECRET` | نعم | توقيع جلسة الإدارة، استخدم قيمة عشوائية طويلة |
+| `ENCRYPTION_KEY` | نعم | تشفير Supabase tokens؛ لا تغيرها بعد إضافة الحسابات |
+| `APP_URL` | نعم | الرابط الخارجي للمنصة |
+| `DATABASE_PATH` | نعم في Docker | المسار الدائم لملف SQLite |
+
+## الأمان
+
+- لا ترفع ملف `.env` إلى Git.
+- ضع المنصة خلف HTTPS إذا فتحتها خارج الشبكة المحلية.
+- للوصول الشخصي، يوصى باستخدام Tailscale أو VPN وعدم فتح المنفذ مباشرة على الإنترنت.
+- لا تستخدم `service_role` داخل المنصة.
+- حذف الحساب من SupaAction يحذف نسخته المحلية وسجلاته فقط ولا يغيّر شيئًا في Supabase.
+- يتم الاحتفاظ بسجل التنشيط لمدة 90 يومًا.
+
+## ملاحظة مهمة
+
+المنصة تنشئ نشاط قاعدة بيانات فعليًا، لكنها ليست ضمان SLA ولا بديلًا لخطة Supabase المدفوعة. سياسات الخطة المجانية قد تتغير، لذلك راجع دائمًا [توثيق إيقاف المشاريع](https://supabase.com/docs/guides/platform/free-project-pausing).
