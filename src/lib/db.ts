@@ -74,6 +74,14 @@ function migrate(database: Db) {
       locked_until TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS admin_auth (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      password_salt TEXT NOT NULL,
+      password_hash TEXT NOT NULL,
+      session_version INTEGER NOT NULL DEFAULT 1,
+      updated_at TEXT NOT NULL
+    );
+
     CREATE INDEX IF NOT EXISTS idx_projects_due ON projects(enabled, next_ping_at);
     CREATE INDEX IF NOT EXISTS idx_ping_runs_started ON ping_runs(started_at DESC);
     INSERT OR IGNORE INTO settings (id) VALUES (1);

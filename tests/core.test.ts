@@ -38,6 +38,24 @@ test("rate limits repeated failed logins", async () => {
   clearFailedLogins(key)
 })
 
+test("stores a changed admin password securely and revokes old sessions", async () => {
+  const { createSessionToken, setAdminPassword, verifyPassword, verifySessionToken } = await import("../src/lib/auth")
+  const oldSession = createSessionToken()
+  assert.equal(verifyPassword("test-password"), true)
+  assert.equal(verifySessionToken(oldSession), true)
+
+  setAdminPassword("new-secure-password")
+
+  assert.equal(verifyPassword("test-password"), false)
+  assert.equal(verifyPassword("new-secure-password"), true)
+  assert.equal(verifySessionToken(oldSession), false)
+  assert.equal(verifySessionToken(createSessionToken()), true)
+
+  const { getDb } = await import("../src/lib/db")
+  const stored = getDb().prepare("SELECT password_hash FROM admin_auth WHERE id = 1").get() as { password_hash: string }
+  assert.equal(stored.password_hash.includes("new-secure-password"), false)
+})
+
 test("discovers projects and executes a read-only database ping", async () => {
   const originalFetch = globalThis.fetch
   const calls: Array<{ url: string; method: string }> = []

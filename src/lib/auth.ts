@@ -1,5 +1,6 @@
-import { createHmac, timingSafeEqual } from "node:crypto"
+import { createHmac, randomBytes, scryptSync, timingSafeEqual } from "node:crypto"
 import { cookies } from "next/headers"
+import { getDb } from "@/lib/db"
 import { appPassword, appUrl, sessionSecret } from "@/lib/env"
 
 const COOKIE_NAME = "supaaction_session"
@@ -8,6 +9,7 @@ const LOGIN_WINDOW_MS = 15 * 60 * 1000
 const LOGIN_MAX_ATTEMPTS = 5
 
 type LoginAttempt = { count: number; resetsAt: number }
+type AdminAuthRow = { password_salt: string; password_hash: string; session_version: number }
 
 declare global {
   var __supaactionLoginAttempts: Map<string, LoginAttempt> | undefined
@@ -26,8 +28,45 @@ function safeEqual(left: string, right: string) {
   return a.length === b.length && timingSafeEqual(a, b)
 }
 
+function getAdminAuth() {
+  return getDb().prepare("SELECT password_salt, password_hash, session_version FROM admin_auth WHERE id = 1")
+    .get() as AdminAuthRow | undefined
+}
+
+function derivePasswordHash(password: string, salt: string) {
+  return scryptSync(password, salt, 64)
+}
+
 export function verifyPassword(candidate: string) {
-  return safeEqual(candidate, appPassword())
+  const stored = getAdminAuth()
+  if (!stored) return safeEqual(candidate, appPassword())
+
+  try {
+    const actual = derivePasswordHash(candidate, stored.password_salt)
+    const expected = Buffer.from(stored.password_hash, "hex")
+    return actual.length === expected.length && timingSafeEqual(actual, expected)
+  } catch {
+    return false
+  }
+}
+
+export function setAdminPassword(password: string) {
+  const salt = randomBytes(32).toString("hex")
+  const hash = derivePasswordHash(password, salt).toString("hex")
+  const now = new Date().toISOString()
+  getDb().prepare(`
+    INSERT INTO admin_auth (id, password_salt, password_hash, session_version, updated_at)
+    VALUES (1, ?, ?, 1, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      password_salt = excluded.password_salt,
+      password_hash = excluded.password_hash,
+      session_version = admin_auth.session_version + 1,
+      updated_at = excluded.updated_at
+  `).run(salt, hash, now)
+}
+
+function getSessionVersion() {
+  return getAdminAuth()?.session_version ?? 0
 }
 
 export function loginRateLimit(key: string) {
@@ -59,7 +98,7 @@ export function clearFailedLogins(key: string) {
 
 export function createSessionToken() {
   const expiresAt = Math.floor(Date.now() / 1000) + SESSION_TTL_SECONDS
-  const payload = Buffer.from(JSON.stringify({ sub: "admin", exp: expiresAt })).toString("base64url")
+  const payload = Buffer.from(JSON.stringify({ sub: "admin", exp: expiresAt, ver: getSessionVersion() })).toString("base64url")
   return `${payload}.${sign(payload)}`
 }
 
@@ -72,8 +111,10 @@ export function verifySessionToken(token?: string) {
     const parsed = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as {
       sub?: string
       exp?: number
+      ver?: number
     }
-    return parsed.sub === "admin" && typeof parsed.exp === "number" && parsed.exp > Date.now() / 1000
+    return parsed.sub === "admin" && typeof parsed.exp === "number" && parsed.exp > Date.now() / 1000 &&
+      parsed.ver === getSessionVersion()
   } catch {
     return false
   }
