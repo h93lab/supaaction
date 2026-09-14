@@ -20,10 +20,9 @@ ENV NODE_ENV=production \
 
 RUN groupadd --system --gid 1001 nodejs \
     && useradd --system --uid 1001 --gid nodejs nextjs \
-    && mkdir -p /data \
-    && chown nextjs:nodejs /data
+    && mkdir -p /data /app/public \
+    && chown -R nextjs:nodejs /data /app/public
 
-COPY --from=builder --chown=nextjs:nodejs /app/public ./public
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
 COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
 
