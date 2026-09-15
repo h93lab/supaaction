@@ -1,13 +1,12 @@
 import { NextResponse } from "next/server"
-import { headers } from "next/headers"
 import { clearFailedLogins, loginRateLimit, recordFailedLogin, setSessionCookie, verifyPassword } from "@/lib/auth"
 import { requireSameOrigin } from "@/lib/api"
+import { recordAudit } from "@/lib/db"
 
 export async function POST(request: Request) {
-  const originError = await requireSameOrigin()
+  const originError = requireSameOrigin(request)
   if (originError) return originError
-  const incoming = await headers()
-  const clientKey = incoming.get("x-forwarded-for")?.split(",")[0]?.trim() || incoming.get("x-real-ip") || "local"
+  const clientKey = "admin-login"
   const rateLimit = loginRateLimit(clientKey)
   if (!rateLimit.allowed) {
     return NextResponse.json({ error: "محاولات كثيرة. حاول مرة أخرى لاحقًا" }, {
@@ -22,5 +21,6 @@ export async function POST(request: Request) {
   }
   clearFailedLogins(clientKey)
   await setSessionCookie()
+  recordAudit("auth.login", "admin", null, "تم تسجيل دخول الإدارة بنجاح")
   return NextResponse.json({ ok: true })
 }

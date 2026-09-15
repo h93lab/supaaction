@@ -1,0 +1,18 @@
+services:
+  supaaction:
+    build:
+      network: host
+    ports: !override
+      - "${SUPAACTION_BIND_ADDRESS:-192.168.0.250}:${SUPAACTION_PORT:-3200}:3000"
+    volumes: !override
+      - "${SUPAACTION_DATA_PATH:-/srv/storage/supaaction/data}:/data"
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
+
+  supaaction-worker:
+    volumes: !override
+      - "${SUPAACTION_DATA_PATH:-/srv/storage/supaaction/data}:/data"
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1

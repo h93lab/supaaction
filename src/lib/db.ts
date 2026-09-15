@@ -2,7 +2,8 @@ import fs from "node:fs"
 import path from "node:path"
 import Database from "better-sqlite3"
 import { databasePath } from "@/lib/env"
-import type { AccountRecord, AppSettings, DashboardData, PingRunRecord, ProjectRecord } from "@/lib/types"
+import { randomUUID } from "node:crypto"
+import type { AccountRecord, AppSettings, AuditLogRecord, DashboardData, PaginatedResult, PingRunRecord, ProjectRecord } from "@/lib/types"
 
 type Db = Database.Database
 
@@ -82,8 +83,29 @@ function migrate(database: Db) {
       updated_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS auth_attempts (
+      key TEXT PRIMARY KEY,
+      attempt_count INTEGER NOT NULL,
+      resets_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS audit_logs (
+      id TEXT PRIMARY KEY,
+      action TEXT NOT NULL,
+      target_type TEXT NOT NULL,
+      target_id TEXT,
+      summary TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS service_status (
+      name TEXT PRIMARY KEY,
+      last_heartbeat_at TEXT NOT NULL
+    );
+
     CREATE INDEX IF NOT EXISTS idx_projects_due ON projects(enabled, next_ping_at);
     CREATE INDEX IF NOT EXISTS idx_ping_runs_started ON ping_runs(started_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at DESC);
     INSERT OR IGNORE INTO settings (id) VALUES (1);
   `)
 }
@@ -142,6 +164,27 @@ export function listProjects(): ProjectRecord[] {
   return rows.map(mapProject)
 }
 
+export function listProjectsPage(page = 1, pageSize = 25, query = ""): PaginatedResult<ProjectRecord> {
+  const normalizedPage = Math.max(1, Math.floor(page))
+  const normalizedPageSize = Math.min(100, Math.max(1, Math.floor(pageSize)))
+  const search = query.trim()
+  const where = search ? "WHERE p.name LIKE ? ESCAPE '\\' OR p.ref LIKE ? ESCAPE '\\' OR a.label LIKE ? ESCAPE '\\'" : ""
+  const escaped = `%${search.replace(/[\\%_]/g, "\\$&")}%`
+  const params = search ? [escaped, escaped, escaped] : []
+  const total = Number((getDb().prepare(`SELECT COUNT(*) AS count FROM projects p JOIN accounts a ON a.id = p.account_id ${where}`)
+    .get(...params) as { count: number }).count)
+  const totalPages = Math.max(1, Math.ceil(total / normalizedPageSize))
+  const safePage = Math.min(normalizedPage, totalPages)
+  const rows = getDb().prepare(`
+    SELECT p.*, a.label AS account_label FROM projects p
+    JOIN accounts a ON a.id = p.account_id
+    ${where}
+    ORDER BY p.enabled DESC, p.name COLLATE NOCASE
+    LIMIT ? OFFSET ?
+  `).all(...params, normalizedPageSize, (safePage - 1) * normalizedPageSize) as ProjectRow[]
+  return { items: rows.map(mapProject), total, page: safePage, pageSize: normalizedPageSize, totalPages }
+}
+
 export function listRecentRuns(limit = 50): PingRunRecord[] {
   const rows = getDb().prepare(`
     SELECT r.*, p.name AS project_name, a.label AS account_label
@@ -157,6 +200,53 @@ export function listRecentRuns(limit = 50): PingRunRecord[] {
     attemptCount: Number(row.attempt_count), error: row.error as string | null,
     trigger: row.trigger as PingRunRecord["trigger"],
   }))
+}
+
+export function listRecentRunsPage(page = 1, pageSize = 50): PaginatedResult<PingRunRecord> {
+  const normalizedPage = Math.max(1, Math.floor(page))
+  const normalizedPageSize = Math.min(100, Math.max(1, Math.floor(pageSize)))
+  const total = Number((getDb().prepare("SELECT COUNT(*) AS count FROM ping_runs").get() as { count: number }).count)
+  const totalPages = Math.max(1, Math.ceil(total / normalizedPageSize))
+  const safePage = Math.min(normalizedPage, totalPages)
+  const offset = (safePage - 1) * normalizedPageSize
+  const rows = getDb().prepare(`
+    SELECT r.*, p.name AS project_name, a.label AS account_label
+    FROM ping_runs r JOIN projects p ON p.ref = r.project_ref
+    JOIN accounts a ON a.id = p.account_id
+    ORDER BY r.started_at DESC LIMIT ? OFFSET ?
+  `).all(normalizedPageSize, offset) as Array<Record<string, string | number | null>>
+  const items = rows.map((row) => ({
+    id: String(row.id), projectRef: String(row.project_ref), projectName: String(row.project_name),
+    accountLabel: String(row.account_label), startedAt: String(row.started_at), completedAt: row.completed_at as string | null,
+    status: row.status as PingRunRecord["status"], latencyMs: row.latency_ms as number | null,
+    httpStatus: row.http_status as number | null, attemptCount: Number(row.attempt_count),
+    error: row.error as string | null, trigger: row.trigger as PingRunRecord["trigger"],
+  }))
+  return { items, total, page: safePage, pageSize: normalizedPageSize, totalPages }
+}
+
+export function recordAudit(action: string, targetType: string, targetId: string | null, summary: string) {
+  getDb().prepare("INSERT INTO audit_logs (id, action, target_type, target_id, summary, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+    .run(randomUUID(), action, targetType, targetId, summary.slice(0, 500), new Date().toISOString())
+}
+
+export function listAuditLogs(limit = 100): AuditLogRecord[] {
+  const rows = getDb().prepare("SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT ?").all(Math.min(500, Math.max(1, limit))) as Array<Record<string, string | null>>
+  return rows.map((row) => ({
+    id: String(row.id), action: String(row.action), targetType: String(row.target_type),
+    targetId: row.target_id, summary: String(row.summary), createdAt: String(row.created_at),
+  }))
+}
+
+export function updateServiceHeartbeat(name: string) {
+  getDb().prepare(`INSERT INTO service_status (name, last_heartbeat_at) VALUES (?, ?)
+    ON CONFLICT(name) DO UPDATE SET last_heartbeat_at = excluded.last_heartbeat_at`)
+    .run(name, new Date().toISOString())
+}
+
+export function getServiceHeartbeat(name: string) {
+  const row = getDb().prepare("SELECT last_heartbeat_at FROM service_status WHERE name = ?").get(name) as { last_heartbeat_at: string } | undefined
+  return row?.last_heartbeat_at ?? null
 }
 
 export function getSettings(): AppSettings {

@@ -30,3 +30,13 @@ export function databasePath() {
 export function appUrl() {
   return (process.env.APP_URL?.trim() || "http://localhost:3000").replace(/\/$/, "")
 }
+
+export function sessionTtlSeconds() {
+  const hours = Number(process.env.SESSION_TTL_HOURS || 24)
+  if (!Number.isFinite(hours) || hours < 1 || hours > 720) return 24 * 60 * 60
+  return Math.floor(hours * 60 * 60)
+}
+
+export function schedulerEnabled() {
+  return process.env.SCHEDULER_ENABLED?.trim().toLowerCase() !== "false"
+}

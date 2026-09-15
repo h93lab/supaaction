@@ -12,7 +12,11 @@
 - تشغيل الطلبات بتوازٍ محدود قابل للضبط.
 - تشفير التوكنات داخل SQLite باستخدام AES-256-GCM.
 - جلسة إدارة محمية بكلمة مرور وCookie من نوع `HttpOnly`.
+- تغيير كلمة مرور الإدارة من الواجهة مع إلغاء كل الجلسات القديمة.
+- حماية CSRF وSecurity Headers وRate Limit دائم داخل SQLite.
 - مزامنة دورية لاكتشاف المشاريع الجديدة.
+- Worker مستقل للجدولة مع health check لنبضه.
+- سجل تدقيق للتغييرات الإدارية دون حفظ الأسرار.
 - Dark mode وواجهة عربية RTL مبنية على shadcn/ui وبنية shadcn dashboard.
 - Docker image يعمل بصلاحيات مستخدم غير root مع health check.
 
@@ -45,6 +49,14 @@ docker compose ps
 ```
 
 افتح `http://localhost:3000` وسجل الدخول باستخدام `APP_PASSWORD`.
+
+للنشر على السيرفر باستخدام ملف الإنتاج المنفصل:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+```
+
+يمكن تخصيص عنوان الربط والمنفذ ومسار البيانات عبر `SUPAACTION_BIND_ADDRESS` و`SUPAACTION_PORT` و`SUPAACTION_DATA_PATH`.
 
 ## إنشاء Supabase Access Token
 
@@ -101,6 +113,11 @@ npm run check
 | `ENCRYPTION_KEY` | نعم | تشفير Supabase tokens؛ لا تغيرها بعد إضافة الحسابات |
 | `APP_URL` | نعم | الرابط الخارجي للمنصة |
 | `DATABASE_PATH` | نعم في Docker | المسار الدائم لملف SQLite |
+| `SESSION_TTL_HOURS` | لا | مدة جلسة الإدارة بالساعات، الافتراضي 24 |
+| `SCHEDULER_ENABLED` | لا | يشغّل المجدول داخل عملية الويب؛ Docker يعطله لأن Worker مستقل يتولى المهمة |
+| `SUPAACTION_BIND_ADDRESS` | لا | عنوان الشبكة الذي يرتبط به منفذ الإنتاج |
+| `SUPAACTION_PORT` | لا | منفذ الإنتاج الخارجي، الافتراضي 3200 |
+| `SUPAACTION_DATA_PATH` | لا | مسار بيانات SQLite الدائم في خادم الإنتاج |
 
 ## الأمان
 
@@ -110,6 +127,8 @@ npm run check
 - لا تستخدم `service_role` داخل المنصة.
 - حذف الحساب من SupaAction يحذف نسخته المحلية وسجلاته فقط ولا يغيّر شيئًا في Supabase.
 - يتم الاحتفاظ بسجل التنشيط لمدة 90 يومًا.
+- تنتهي جلسة الإدارة افتراضيًا بعد 24 ساعة، وتُلغى فور تغيير كلمة المرور.
+- كل عمليات الكتابة تتطلب جلسة صالحة وOrigin مطابقًا لـ `APP_URL`.
 
 ## ملاحظة مهمة
 

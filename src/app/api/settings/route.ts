@@ -1,7 +1,7 @@
 import { z } from "zod"
 import { NextResponse } from "next/server"
 import { apiError, requireApiAuth, requireSameOrigin } from "@/lib/api"
-import { getDb, getSettings } from "@/lib/db"
+import { getDb, getSettings, recordAudit } from "@/lib/db"
 
 const schema = z.object({
   pingIntervalHours: z.number().int().min(1).max(168),
@@ -23,7 +23,7 @@ export async function GET() {
 export async function PUT(request: Request) {
   const authError = await requireApiAuth()
   if (authError) return authError
-  const originError = await requireSameOrigin()
+  const originError = requireSameOrigin(request)
   if (originError) return originError
   try {
     const input = schema.parse(await request.json())
@@ -31,6 +31,7 @@ export async function PUT(request: Request) {
       request_timeout_seconds = ?, concurrency = ?, auto_sync = ?, sync_interval_hours = ?, timezone = ? WHERE id = 1`)
       .run(input.pingIntervalHours, input.retryCount, input.retryDelaySeconds, input.requestTimeoutSeconds,
         input.concurrency, input.autoSync ? 1 : 0, input.syncIntervalHours, input.timezone)
+    recordAudit("settings.updated", "settings", null, "تم تحديث إعدادات الجدولة والمزامنة")
     return NextResponse.json(getSettings())
   } catch (error) {
     return apiError(error, "تعذر حفظ الإعدادات")

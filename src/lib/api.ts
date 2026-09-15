@@ -1,6 +1,6 @@
-import { headers } from "next/headers"
 import { NextResponse } from "next/server"
 import { isAuthenticated } from "@/lib/auth"
+import { appUrl } from "@/lib/env"
 
 export async function requireApiAuth() {
   if (!(await isAuthenticated())) {
@@ -9,12 +9,15 @@ export async function requireApiAuth() {
   return null
 }
 
-export async function requireSameOrigin() {
-  const incoming = await headers()
-  const origin = incoming.get("origin")
-  if (!origin) return null
-  const host = incoming.get("x-forwarded-host") || incoming.get("host")
-  if (!host || new URL(origin).host !== host) {
+export function requireSameOrigin(request: Request) {
+  const origin = request.headers.get("origin")
+  let valid = false
+  try {
+    valid = Boolean(origin) && new URL(origin as string).origin === new URL(appUrl()).origin
+  } catch {
+    valid = false
+  }
+  if (!valid) {
     return NextResponse.json({ error: "طلب غير صالح" }, { status: 403 })
   }
   return null

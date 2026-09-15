@@ -1,5 +1,6 @@
 services:
   supaaction:
+    image: supaaction:local
     build:
       context: .
       dockerfile: Dockerfile
@@ -7,6 +8,8 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      SCHEDULER_ENABLED: "false"
     ports:
       - "3000:3000"
     volumes:
@@ -15,6 +18,23 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+
+  supaaction-worker:
+    image: supaaction:local
+    pull_policy: never
+    container_name: supaaction-worker
+    restart: unless-stopped
+    command: ["node", "dist/worker.cjs"]
+    env_file:
+      - .env
+    volumes:
+      - supaaction-data:/data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      disable: true
 
 volumes:
   supaaction-data:

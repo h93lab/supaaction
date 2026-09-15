@@ -54,6 +54,23 @@ export type AppSettings = {
   timezone: string
 }
 
+export type AuditLogRecord = {
+  id: string
+  action: string
+  targetType: string
+  targetId: string | null
+  summary: string
+  createdAt: string
+}
+
+export type PaginatedResult<T> = {
+  items: T[]
+  total: number
+  page: number
+  pageSize: number
+  totalPages: number
+}
+
 export type DashboardData = {
   totals: {
     accounts: number

@@ -1,22 +1,12 @@
 import { createHmac, randomBytes, scryptSync, timingSafeEqual } from "node:crypto"
 import { cookies } from "next/headers"
 import { getDb } from "@/lib/db"
-import { appPassword, appUrl, sessionSecret } from "@/lib/env"
+import { appPassword, appUrl, sessionSecret, sessionTtlSeconds } from "@/lib/env"
 
 const COOKIE_NAME = "supaaction_session"
-const SESSION_TTL_SECONDS = 60 * 60 * 24 * 30
 const LOGIN_WINDOW_MS = 15 * 60 * 1000
-const LOGIN_MAX_ATTEMPTS = 5
-
-type LoginAttempt = { count: number; resetsAt: number }
+const LOGIN_MAX_ATTEMPTS = 10
 type AdminAuthRow = { password_salt: string; password_hash: string; session_version: number }
-
-declare global {
-  var __supaactionLoginAttempts: Map<string, LoginAttempt> | undefined
-}
-
-const loginAttempts = globalThis.__supaactionLoginAttempts ?? new Map<string, LoginAttempt>()
-globalThis.__supaactionLoginAttempts = loginAttempts
 
 function sign(value: string) {
   return createHmac("sha256", sessionSecret()).update(value).digest("base64url")
@@ -71,33 +61,34 @@ function getSessionVersion() {
 
 export function loginRateLimit(key: string) {
   const now = Date.now()
-  const attempt = loginAttempts.get(key)
-  if (!attempt || attempt.resetsAt <= now) {
-    loginAttempts.delete(key)
+  const attempt = getDb().prepare("SELECT attempt_count, resets_at FROM auth_attempts WHERE key = ?").get(key) as
+    { attempt_count: number; resets_at: number } | undefined
+  if (!attempt || attempt.resets_at <= now) {
+    getDb().prepare("DELETE FROM auth_attempts WHERE key = ? OR resets_at <= ?").run(key, now)
     return { allowed: true, retryAfterSeconds: 0 }
   }
   return {
-    allowed: attempt.count < LOGIN_MAX_ATTEMPTS,
-    retryAfterSeconds: Math.ceil((attempt.resetsAt - now) / 1000),
+    allowed: attempt.attempt_count < LOGIN_MAX_ATTEMPTS,
+    retryAfterSeconds: Math.ceil((attempt.resets_at - now) / 1000),
   }
 }
 
 export function recordFailedLogin(key: string) {
   const now = Date.now()
-  const current = loginAttempts.get(key)
-  if (!current || current.resetsAt <= now) {
-    loginAttempts.set(key, { count: 1, resetsAt: now + LOGIN_WINDOW_MS })
-  } else {
-    current.count += 1
-  }
+  getDb().prepare(`
+    INSERT INTO auth_attempts (key, attempt_count, resets_at) VALUES (?, 1, ?)
+    ON CONFLICT(key) DO UPDATE SET
+      attempt_count = CASE WHEN auth_attempts.resets_at <= ? THEN 1 ELSE auth_attempts.attempt_count + 1 END,
+      resets_at = CASE WHEN auth_attempts.resets_at <= ? THEN excluded.resets_at ELSE auth_attempts.resets_at END
+  `).run(key, now + LOGIN_WINDOW_MS, now, now)
 }
 
 export function clearFailedLogins(key: string) {
-  loginAttempts.delete(key)
+  getDb().prepare("DELETE FROM auth_attempts WHERE key = ?").run(key)
 }
 
 export function createSessionToken() {
-  const expiresAt = Math.floor(Date.now() / 1000) + SESSION_TTL_SECONDS
+  const expiresAt = Math.floor(Date.now() / 1000) + sessionTtlSeconds()
   const payload = Buffer.from(JSON.stringify({ sub: "admin", exp: expiresAt, ver: getSessionVersion() })).toString("base64url")
   return `${payload}.${sign(payload)}`
 }
@@ -132,7 +123,7 @@ export async function setSessionCookie() {
     sameSite: "strict",
     secure: appUrl().startsWith("https://"),
     path: "/",
-    maxAge: SESSION_TTL_SECONDS,
+    maxAge: sessionTtlSeconds(),
   })
 }
 

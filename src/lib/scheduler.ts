@@ -1,6 +1,6 @@
 import cron from "node-cron"
 import { syncAllAccounts } from "@/lib/accounts"
-import { acquireJobLock, getDb, getSettings, releaseJobLock } from "@/lib/db"
+import { acquireJobLock, getDb, getSettings, releaseJobLock, updateServiceHeartbeat } from "@/lib/db"
 import { runDuePings } from "@/lib/pinger"
 
 declare global {
@@ -24,6 +24,7 @@ export function startScheduler() {
   if (globalThis.__supaactionSchedulerStarted) return
   globalThis.__supaactionSchedulerStarted = true
   getDb()
+  updateServiceHeartbeat("scheduler")
 
   cron.schedule("* * * * *", async () => {
     try {
@@ -31,8 +32,12 @@ export function startScheduler() {
       await runDuePings()
       const retentionCutoff = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString()
       getDb().prepare("DELETE FROM ping_runs WHERE started_at < ?").run(retentionCutoff)
+      const auditRetentionCutoff = new Date(Date.now() - 180 * 24 * 60 * 60 * 1000).toISOString()
+      getDb().prepare("DELETE FROM audit_logs WHERE created_at < ?").run(auditRetentionCutoff)
     } catch (error) {
       console.error("[scheduler] tick failed", error)
+    } finally {
+      updateServiceHeartbeat("scheduler")
     }
   })
 

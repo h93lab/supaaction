@@ -9,6 +9,7 @@ process.env.DATABASE_PATH = join(testDir, "test.db")
 process.env.ENCRYPTION_KEY = "test-encryption-secret-that-is-long-enough"
 process.env.SESSION_SECRET = "test-session-secret-that-is-long-enough"
 process.env.APP_PASSWORD = "test-password"
+process.env.APP_URL = "https://supa.example.test"
 
 after(() => rmSync(testDir, { recursive: true, force: true }))
 
@@ -33,9 +34,33 @@ test("rate limits repeated failed logins", async () => {
   const key = "unit-test-client"
   clearFailedLogins(key)
   assert.equal(loginRateLimit(key).allowed, true)
-  for (let attempt = 0; attempt < 5; attempt += 1) recordFailedLogin(key)
+  for (let attempt = 0; attempt < 10; attempt += 1) recordFailedLogin(key)
   assert.equal(loginRateLimit(key).allowed, false)
+  const { getDb } = await import("../src/lib/db")
+  assert.equal((getDb().prepare("SELECT attempt_count FROM auth_attempts WHERE key = ?").get(key) as { attempt_count: number }).attempt_count, 10)
   clearFailedLogins(key)
+})
+
+test("rejects missing and cross-origin mutation requests", async () => {
+  const { requireSameOrigin } = await import("../src/lib/api")
+  assert.equal(requireSameOrigin(new Request("https://supa.example.test/api/settings"))?.status, 403)
+  assert.equal(requireSameOrigin(new Request("https://supa.example.test/api/settings", { headers: { origin: "https://evil.example" } }))?.status, 403)
+  assert.equal(requireSameOrigin(new Request("https://supa.example.test/api/settings", { headers: { origin: "https://supa.example.test" } })), null)
+})
+
+test("records administrative audit events without secrets", async () => {
+  const { listAuditLogs, recordAudit } = await import("../src/lib/db")
+  recordAudit("settings.updated", "settings", null, "Settings changed")
+  const [entry] = listAuditLogs(1)
+  assert.equal(entry.action, "settings.updated")
+  assert.equal(entry.summary, "Settings changed")
+})
+
+test("tracks scheduler heartbeat health", async () => {
+  const { getServiceHeartbeat, updateServiceHeartbeat } = await import("../src/lib/db")
+  assert.equal(getServiceHeartbeat("test-worker"), null)
+  updateServiceHeartbeat("test-worker")
+  assert.equal(typeof getServiceHeartbeat("test-worker"), "string")
 })
 
 test("stores a changed admin password securely and revokes old sessions", async () => {
@@ -71,14 +96,17 @@ test("discovers projects and executes a read-only database ping", async () => {
 
   try {
     const { addAccount } = await import("../src/lib/accounts")
-    const { listProjects, listRecentRuns } = await import("../src/lib/db")
+    const { listProjects, listProjectsPage, listRecentRuns, listRecentRunsPage } = await import("../src/lib/db")
     const { pingProjects } = await import("../src/lib/pinger")
     const added = await addAccount("Demo account", "sbp_example_token_1234567890")
     assert.equal(added.projectCount, 1)
     assert.equal(listProjects()[0].name, "Demo")
+    assert.equal(listProjectsPage(1, 25, "Demo").total, 1)
+    assert.equal(listProjectsPage(1, 25, "missing").total, 0)
     const results = await pingProjects(undefined, "manual")
     assert.equal(results[0].status, "success")
     assert.equal(listRecentRuns(1)[0].httpStatus, 201)
+    assert.equal(listRecentRunsPage(1, 1).total, 1)
     assert.equal(calls.some((call) => call.url.endsWith("/projects") && call.method === "GET"), true)
     assert.equal(calls.some((call) => call.url.includes("/database/query/read-only") && call.method === "POST"), true)
   } finally {

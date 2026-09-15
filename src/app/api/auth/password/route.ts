@@ -1,4 +1,3 @@
-import { headers } from "next/headers"
 import { NextResponse } from "next/server"
 import { z } from "zod"
 import {
@@ -10,6 +9,7 @@ import {
   verifyPassword,
 } from "@/lib/auth"
 import { requireApiAuth, requireSameOrigin } from "@/lib/api"
+import { recordAudit } from "@/lib/db"
 
 const schema = z.object({
   currentPassword: z.string().min(1).max(256),
@@ -19,12 +19,10 @@ const schema = z.object({
 export async function PUT(request: Request) {
   const authError = await requireApiAuth()
   if (authError) return authError
-  const originError = await requireSameOrigin()
+  const originError = requireSameOrigin(request)
   if (originError) return originError
 
-  const incoming = await headers()
-  const client = incoming.get("x-forwarded-for")?.split(",")[0]?.trim() || incoming.get("x-real-ip") || "local"
-  const rateLimitKey = `password-change:${client}`
+  const rateLimitKey = "admin-password-change"
   const rateLimit = loginRateLimit(rateLimitKey)
   if (!rateLimit.allowed) {
     return NextResponse.json({ error: "محاولات كثيرة. حاول مرة أخرى لاحقًا" }, {
@@ -47,6 +45,7 @@ export async function PUT(request: Request) {
 
   clearFailedLogins(rateLimitKey)
   setAdminPassword(parsed.data.newPassword)
+  recordAudit("password.changed", "admin", null, "تم تغيير كلمة مرور الإدارة وإلغاء الجلسات السابقة")
   await clearSessionCookie()
   return NextResponse.json({ ok: true })
 }
