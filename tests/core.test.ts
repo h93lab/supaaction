@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
-import { mkdtempSync, rmSync } from "node:fs"
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs"
+import { createRequire } from "node:module"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import test, { after } from "node:test"
@@ -10,6 +11,44 @@ process.env.ENCRYPTION_KEY = "test-encryption-secret-that-is-long-enough"
 process.env.SESSION_SECRET = "test-session-secret-that-is-long-enough"
 process.env.APP_PASSWORD = "test-password"
 process.env.APP_URL = "https://supa.example.test"
+
+const SESSION_COOKIE_NAME = "supaaction_session"
+const cookieJar: { name: string; value: string; options: Record<string, unknown> } = {
+  name: SESSION_COOKIE_NAME,
+  value: "",
+  options: {},
+}
+
+function setSessionCookie(value: string) {
+  cookieJar.name = SESSION_COOKIE_NAME
+  cookieJar.value = value
+  cookieJar.options = {}
+}
+
+function clearSessionCookie() {
+  cookieJar.name = SESSION_COOKIE_NAME
+  cookieJar.value = ""
+  cookieJar.options = {}
+}
+
+const require = createRequire(import.meta.url)
+const nextHeaders = require("next/headers") as {
+  cookies: () => Promise<{
+    get: (name: string) => { name: string; value: string } | undefined
+    set: (name: string, value: string, options?: Record<string, unknown>) => void
+  }>
+}
+nextHeaders.cookies = async () => ({
+  get(name: string) {
+    if (name === cookieJar.name && cookieJar.value) return { name, value: cookieJar.value }
+    return undefined
+  },
+  set(name: string, value: string, options?: Record<string, unknown>) {
+    cookieJar.name = name
+    cookieJar.value = value
+    cookieJar.options = options ?? {}
+  },
+})
 
 after(() => rmSync(testDir, { recursive: true, force: true }))
 
@@ -30,12 +69,36 @@ async function seedProject(ref: string, remoteStatus: string) {
 }
 
 test("encrypts and decrypts credentials without storing plaintext", async () => {
-  const { decryptSecret, encryptSecret } = await import("../src/lib/crypto")
-  const plaintext = "sbp_example_token_1234567890"
-  const encrypted = encryptSecret(plaintext)
-  assert.notEqual(encrypted, plaintext)
-  assert.equal(encrypted.includes(plaintext), false)
-  assert.equal(decryptSecret(encrypted), plaintext)
+  const originalFetch = globalThis.fetch
+  const plaintext = "sbp_plaintext_storage_token_9f3a7c2b"
+  globalThis.fetch = async (input) => {
+    if (String(input).endsWith("/projects")) {
+      return new Response(JSON.stringify([{ ref: "plaintextstorage001", name: "Plaintext", status: "ACTIVE_HEALTHY" }]), { status: 200 })
+    }
+    return new Response("not found", { status: 404 })
+  }
+  try {
+    const { addAccount, getAccountToken } = await import("../src/lib/accounts")
+    const { getDb } = await import("../src/lib/db")
+    const added = await addAccount("Plaintext account", plaintext)
+    assert.equal(getAccountToken(added.accountId), plaintext)
+
+    const database = getDb()
+    database.pragma("wal_checkpoint(TRUNCATE)")
+    const file = process.env.DATABASE_PATH as string
+    assert.equal(readFileSync(file).includes(plaintext), false, "plaintext token is present in the SQLite database file")
+    for (const suffix of ["-wal", "-shm"]) {
+      const sidecar = `${file}${suffix}`
+      if (existsSync(sidecar) && readFileSync(sidecar).length > 0) {
+        assert.equal(readFileSync(sidecar).includes(plaintext), false, `plaintext token is present in ${suffix}`)
+      }
+    }
+    database.prepare("DELETE FROM project_accounts WHERE project_ref = ?").run("plaintextstorage001")
+    database.prepare("DELETE FROM projects WHERE ref = ?").run("plaintextstorage001")
+    database.prepare("DELETE FROM accounts WHERE id = ?").run(added.accountId)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
 })
 
 test("creates database defaults", async () => {
@@ -58,25 +121,108 @@ test("rate limits repeated failed logins", async () => {
 })
 
 test("rejects missing and cross-origin mutation requests", async () => {
-  const { requireSameOrigin } = await import("../src/lib/api")
-  assert.equal(requireSameOrigin(new Request("https://supa.example.test/api/settings"))?.status, 403)
-  assert.equal(requireSameOrigin(new Request("https://supa.example.test/api/settings", { headers: { origin: "https://evil.example" } }))?.status, 403)
-  assert.equal(requireSameOrigin(new Request("https://supa.example.test/api/settings", { headers: { origin: "https://supa.example.test" } })), null)
+  const fs = await import("node:fs")
+  const path = await import("node:path")
+  const { createSessionToken } = await import("../src/lib/auth")
+  setSessionCookie(createSessionToken())
+
+  const apiDir = path.join(process.cwd(), "src", "app", "api")
+  const routeFiles = (fs.readdirSync(apiDir, { recursive: true }) as string[]).filter((file) => file.endsWith("route.ts"))
+  const methods = ["POST", "PUT", "PATCH", "DELETE"]
+  const mutating: Array<{ method: string; handler: (request: Request, context: unknown) => Promise<Response> }> = []
+
+  for (const file of routeFiles) {
+    const routeModule = await import(`../src/app/api/${file}`) as Record<string, unknown>
+    for (const method of methods) {
+      if (typeof routeModule[method] === "function") {
+        mutating.push({ method, handler: routeModule[method] as (request: Request, context: unknown) => Promise<Response> })
+      }
+    }
+  }
+
+  assert.ok(mutating.length >= 9, `expected at least 9 mutating handlers, found ${mutating.length}`)
+  for (const { method, handler } of mutating) {
+    const response = await handler(new Request("https://supa.example.test/api/accounts", {
+      method,
+      headers: { origin: "https://evil.example" },
+    }), { params: Promise.resolve({ id: "dummy-id", ref: "dummy-ref" }) })
+    assert.equal(response.status, 403, `${method} handler did not reject a cross-origin request`)
+  }
 })
 
 test("records administrative audit events without secrets", async () => {
-  const { listAuditLogs, recordAudit } = await import("../src/lib/db")
-  recordAudit("settings.updated", "settings", null, "Settings changed")
-  const [entry] = listAuditLogs(1)
-  assert.equal(entry.action, "settings.updated")
-  assert.equal(entry.summary, "Settings changed")
+  const originalFetch = globalThis.fetch
+  const token = "sbp_no_leak_marker_9f3a7c2b"
+  const fragment = token.slice(4, -4)
+  globalThis.fetch = async (input) => {
+    if (String(input).endsWith("/projects")) {
+      return new Response(JSON.stringify([{ ref: "auditleakproject01", name: "Audit", status: "ACTIVE_HEALTHY" }]), { status: 200 })
+    }
+    return new Response("not found", { status: 404 })
+  }
+  try {
+    const { createSessionToken } = await import("../src/lib/auth")
+    setSessionCookie(createSessionToken())
+    const { POST } = await import("../src/app/api/accounts/route")
+    const response = await POST(new Request("https://supa.example.test/api/accounts", {
+      method: "POST",
+      headers: { origin: "https://supa.example.test", "content-type": "application/json" },
+      body: JSON.stringify({ label: "Audit account", token }),
+    }))
+    assert.equal(response.status, 201)
+    const payload = await response.json() as { accountId: string }
+
+    const { getDb } = await import("../src/lib/db")
+    const database = getDb()
+    const secrets = [token, fragment]
+
+    const auditRows = database.prepare("SELECT * FROM audit_logs").all() as Array<Record<string, unknown>>
+    for (const row of auditRows) {
+      const text = Object.values(row).map((value) => String(value ?? "")).join("\n")
+      for (const secret of secrets) {
+        assert.equal(text.includes(secret), false, `audit_logs leaked ${secret}`)
+      }
+    }
+
+    const accountColumns = (database.pragma("table_info(accounts)") as Array<{ name: string }>)
+      .map((column) => column.name).filter((name) => name !== "encrypted_token")
+    const account = database.prepare("SELECT * FROM accounts WHERE id = ?").get(payload.accountId) as Record<string, unknown>
+    for (const column of accountColumns) {
+      const value = String(account[column] ?? "")
+      for (const secret of secrets) {
+        assert.equal(value.includes(secret), false, `accounts.${column} leaked ${secret}`)
+      }
+    }
+    database.prepare("DELETE FROM project_accounts WHERE project_ref = ?").run("auditleakproject01")
+    database.prepare("DELETE FROM projects WHERE ref = ?").run("auditleakproject01")
+    database.prepare("DELETE FROM accounts WHERE id = ?").run(payload.accountId)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
 })
 
 test("tracks scheduler heartbeat health", async () => {
-  const { getServiceHeartbeat, updateServiceHeartbeat } = await import("../src/lib/db")
-  assert.equal(getServiceHeartbeat("test-worker"), null)
-  updateServiceHeartbeat("test-worker")
-  assert.equal(typeof getServiceHeartbeat("test-worker"), "string")
+  const { getDb, updateServiceHeartbeat } = await import("../src/lib/db")
+  const { GET } = await import("../src/app/api/health/route")
+  const database = getDb()
+  database.prepare("DELETE FROM service_status WHERE name IN ('scheduler', 'ping-sweep')").run()
+
+  updateServiceHeartbeat("scheduler")
+  updateServiceHeartbeat("ping-sweep")
+  let body = await (await GET()).json() as { scheduler: string; sweep: string }
+  assert.equal(body.scheduler, "ok")
+  assert.equal(body.sweep, "ok")
+
+  database.prepare("UPDATE service_status SET last_heartbeat_at = ? WHERE name = 'ping-sweep'")
+    .run(new Date(Date.now() - 11 * 60 * 1000).toISOString())
+  body = await (await GET()).json() as { scheduler: string; sweep: string }
+  assert.equal(body.scheduler, "ok")
+  assert.equal(body.sweep, "stale")
+
+  database.prepare("DELETE FROM service_status WHERE name = 'ping-sweep'").run()
+  body = await (await GET()).json() as { scheduler: string; sweep: string }
+  assert.equal(body.scheduler, "ok")
+  assert.equal(body.sweep, "unknown")
 })
 
 test("stores a changed admin password securely and revokes old sessions", async () => {
@@ -209,8 +355,28 @@ test("does not retry a paused-project response", async () => {
 })
 
 test("backs off failing pings within the ping interval", async () => {
-  const { failureBackoffMinutes } = await import("../src/lib/pinger")
-  assert.deepEqual([1, 2, 3, 4, 5].map((streak) => failureBackoffMinutes(streak)), [15, 60, 360, 720, 720])
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => new Response(JSON.stringify({ message: "bad request" }), { status: 400 })
+  const ref = "backoffwindowproject01"
+  try {
+    await seedProject(ref, "ACTIVE_HEALTHY")
+    const { pingProjects } = await import("../src/lib/pinger")
+    const { getDb } = await import("../src/lib/db")
+    const database = getDb()
+    const backoffMinutes = [15, 60, 360]
+    for (let index = 0; index < backoffMinutes.length; index += 1) {
+      const before = Date.now()
+      await pingProjects([ref], "manual")
+      const row = database.prepare("SELECT next_ping_at, fail_streak FROM projects WHERE ref = ?")
+        .get(ref) as { next_ping_at: string; fail_streak: number }
+      assert.equal(row.fail_streak, index + 1)
+      const expected = backoffMinutes[index] * 60 * 1000
+      const elapsed = Date.parse(row.next_ping_at) - before
+      assert.ok(elapsed >= expected - 2000 && elapsed <= expected + 2000, `streak ${index + 1}: expected ~${expected}ms, got ${elapsed}ms`)
+    }
+  } finally {
+    globalThis.fetch = originalFetch
+  }
 })
 
 test("shortens the next ping when a ping fails and increments the fail streak", async () => {
@@ -242,14 +408,15 @@ test("restores a paused project once per cooldown window", async () => {
     calls.push({ url, method })
     if (url.endsWith("/restore")) return new Response(JSON.stringify({}), { status: 200 })
     if (url.includes("/database/query/read-only")) return new Response(JSON.stringify({ message: "Project is paused" }), { status: 540 })
-    if (method === "GET") return new Response(JSON.stringify({ ref: "pausedproject0000001", name: "Paused", status: "ACTIVE_HEALTHY" }), { status: 200 })
+    if (method === "GET") return new Response(JSON.stringify({ ref, name: ref, status: "PAUSED" }), { status: 200 })
     return new Response("not found", { status: 404 })
   }
-  const ref = "pausedproject0000001"
+  const ref = "pausedcooldownprj001"
   try {
     await seedProject(ref, "PAUSED")
     const { pingProjects } = await import("../src/lib/pinger")
     const { getDb } = await import("../src/lib/db")
+    const database = getDb()
     const restores = () => calls.filter((call) => call.url.endsWith("/restore") && call.method === "POST").length
 
     await pingProjects([ref], "manual")
@@ -258,10 +425,16 @@ test("restores a paused project once per cooldown window", async () => {
     await pingProjects([ref], "manual")
     assert.equal(restores(), 1)
 
-    const row = getDb().prepare("SELECT restore_count, last_restore_at FROM projects WHERE ref = ?")
+    const row = () => database.prepare("SELECT restore_count, last_restore_at FROM projects WHERE ref = ?")
       .get(ref) as { restore_count: number; last_restore_at: string | null }
-    assert.equal(row.restore_count, 1)
-    assert.equal(typeof row.last_restore_at, "string")
+    assert.equal(row().restore_count, 1)
+    assert.equal(typeof row().last_restore_at, "string")
+
+    database.prepare("UPDATE projects SET last_restore_at = ? WHERE ref = ?")
+      .run(new Date(Date.now() - 7 * 60 * 60 * 1000).toISOString(), ref)
+    await pingProjects([ref], "manual")
+    assert.equal(restores(), 2)
+    assert.equal(row().restore_count, 2)
   } finally {
     globalThis.fetch = originalFetch
   }
@@ -328,9 +501,11 @@ test("does not refresh the ping-sweep marker when the sweep throws", async () =>
 test("a retryable restore failure leaves the restore cooldown untouched", async () => {
   const originalFetch = globalThis.fetch
   const ref = "retryablerestore01"
+  const calls: Array<{ url: string; method: string }> = []
   globalThis.fetch = async (input, init) => {
     const url = String(input)
     const method = init?.method || "GET"
+    calls.push({ url, method })
     if (url.endsWith("/restore")) return new Response(JSON.stringify({ message: "Server error" }), { status: 500 })
     if (method === "GET") return new Response(JSON.stringify({ ref, name: ref, status: "PAUSED" }), { status: 200 })
     return new Response("not found", { status: 404 })
@@ -339,12 +514,18 @@ test("a retryable restore failure leaves the restore cooldown untouched", async 
     await seedProject(ref, "PAUSED")
     const { pingProjects } = await import("../src/lib/pinger")
     const { getDb } = await import("../src/lib/db")
+    const restores = () => calls.filter((call) => call.url.endsWith("/restore") && call.method === "POST").length
+
     await pingProjects([ref], "manual")
     const row = getDb().prepare("SELECT last_restore_at, restore_count, last_error FROM projects WHERE ref = ?")
       .get(ref) as { last_restore_at: string | null; restore_count: number; last_error: string }
     assert.equal(row.last_restore_at, null)
     assert.equal(row.restore_count, 0)
     assert.match(row.last_error, /Server error/)
+    assert.equal(restores(), 1)
+
+    await pingProjects([ref], "manual")
+    assert.equal(restores(), 2)
   } finally {
     globalThis.fetch = originalFetch
   }
@@ -429,6 +610,91 @@ test("rejects verifications beyond the in-flight cap without hashing", async () 
   } finally {
     releaseVerificationSlot()
     releaseVerificationSlot()
+  }
+})
+
+test("login charges the rate-limit budget and keeps verifying a direct key", async () => {
+  const env = process.env as Record<string, string | undefined>
+  const previousTrustedProxy = env.TRUSTED_PROXY
+  const { clearFailedLogins } = await import("../src/lib/auth")
+  const { getDb } = await import("../src/lib/db")
+  const { POST } = await import("../src/app/api/auth/login/route")
+  try {
+    delete env.TRUSTED_PROXY
+    clearFailedLogins("direct")
+    const attempt = () => POST(new Request("https://supa.example.test/api/auth/login", {
+      method: "POST",
+      headers: { origin: "https://supa.example.test", "content-type": "application/json" },
+      body: JSON.stringify({ password: "wrong-password" }),
+    }))
+    const first = await attempt()
+    assert.equal(first.status, 401)
+    const charged = (getDb().prepare("SELECT attempt_count FROM auth_attempts WHERE key = ?").get("direct") as { attempt_count: number } | undefined)?.attempt_count ?? 0
+    assert.equal(charged, 1)
+
+    for (let index = 1; index < 10; index += 1) assert.equal((await attempt()).status, 401)
+    const eleventh = await attempt()
+    assert.equal(eleventh.status, 401)
+  } finally {
+    clearFailedLogins("direct")
+    if (previousTrustedProxy === undefined) delete env.TRUSTED_PROXY
+    else env.TRUSTED_PROXY = previousTrustedProxy
+  }
+})
+
+test("behind a trusted proxy, a spent IP is denied while a fresh IP is verified", async () => {
+  const env = process.env as Record<string, string | undefined>
+  const previousTrustedProxy = env.TRUSTED_PROXY
+  const { clearFailedLogins } = await import("../src/lib/auth")
+  const { POST } = await import("../src/app/api/auth/login/route")
+  try {
+    env.TRUSTED_PROXY = "true"
+    clearFailedLogins("ip:1.2.3.4")
+    clearFailedLogins("ip:5.6.7.8")
+    const attempt = (ip: string) => POST(new Request("https://supa.example.test/api/auth/login", {
+      method: "POST",
+      headers: { origin: "https://supa.example.test", "content-type": "application/json", "x-forwarded-for": ip },
+      body: JSON.stringify({ password: "wrong-password" }),
+    }))
+    for (let index = 0; index < 10; index += 1) assert.equal((await attempt("1.2.3.4")).status, 401)
+    const spent = await attempt("1.2.3.4")
+    assert.equal(spent.status, 429)
+    assert.equal(typeof spent.headers.get("Retry-After"), "string")
+    const fresh = await attempt("5.6.7.8")
+    assert.equal(fresh.status, 401)
+  } finally {
+    clearFailedLogins("ip:1.2.3.4")
+    clearFailedLogins("ip:5.6.7.8")
+    if (previousTrustedProxy === undefined) delete env.TRUSTED_PROXY
+    else env.TRUSTED_PROXY = previousTrustedProxy
+  }
+})
+
+test("login sets an HttpOnly session cookie on a correct password", async () => {
+  const env = process.env as Record<string, string | undefined>
+  const previousTrustedProxy = env.TRUSTED_PROXY
+  const { clearFailedLogins, setAdminPassword } = await import("../src/lib/auth")
+  const { POST } = await import("../src/app/api/auth/login/route")
+  const password = "correct-password-for-login"
+  try {
+    delete env.TRUSTED_PROXY
+    clearFailedLogins("direct")
+    setAdminPassword(password)
+    clearSessionCookie()
+    const response = await POST(new Request("https://supa.example.test/api/auth/login", {
+      method: "POST",
+      headers: { origin: "https://supa.example.test", "content-type": "application/json" },
+      body: JSON.stringify({ password }),
+    }))
+    assert.equal(response.status, 200)
+    assert.equal(cookieJar.name, SESSION_COOKIE_NAME)
+    assert.ok(cookieJar.value.length > 0)
+    assert.equal(cookieJar.options.httpOnly, true)
+  } finally {
+    clearSessionCookie()
+    clearFailedLogins("direct")
+    if (previousTrustedProxy === undefined) delete env.TRUSTED_PROXY
+    else env.TRUSTED_PROXY = previousTrustedProxy
   }
 })
 
@@ -697,6 +963,59 @@ test("deleting the only account that can see a project orphans and disables it, 
   }
 })
 
+test("deleting an account re-homes a shared project and orphans a private one, keeping both histories", async () => {
+  const originalFetch = globalThis.fetch
+  const sharedRef = "sharedondelete000001"
+  const privateRef = "privateondelete0001"
+  let projectCalls = 0
+  globalThis.fetch = async (input) => {
+    if (String(input).endsWith("/projects")) {
+      projectCalls += 1
+      if (projectCalls === 1) {
+        return new Response(JSON.stringify([{ ref: sharedRef, name: "Shared", status: "ACTIVE_HEALTHY" }]), { status: 200 })
+      }
+      return new Response(JSON.stringify([
+        { ref: sharedRef, name: "Shared", status: "ACTIVE_HEALTHY" },
+        { ref: privateRef, name: "Private", status: "ACTIVE_HEALTHY" },
+      ]), { status: 200 })
+    }
+    return new Response("not found", { status: 404 })
+  }
+  try {
+    const { addAccount, deleteAccount } = await import("../src/lib/accounts")
+    const { getDb, listProjects } = await import("../src/lib/db")
+    const survivor = await addAccount("Survivor", "sbp_token_survivor_123456")
+    const doomed = await addAccount("Doomed", "sbp_token_doomed_1234567")
+    const database = getDb()
+    const now = new Date().toISOString()
+    database.prepare("INSERT OR IGNORE INTO project_accounts (project_ref, account_id) VALUES (?, ?)").run(sharedRef, survivor.accountId)
+    database.prepare(`INSERT INTO ping_runs (id, project_ref, started_at, status, attempt_count, trigger)
+      VALUES (?, ?, ?, 'success', 1, 'manual')`).run("run-shared-1", sharedRef, now)
+    database.prepare(`INSERT INTO ping_runs (id, project_ref, started_at, status, attempt_count, trigger)
+      VALUES (?, ?, ?, 'success', 1, 'manual')`).run("run-private-1", privateRef, now)
+
+    const result = deleteAccount(doomed.accountId)
+    assert.equal(result.deleted, true)
+    assert.equal(result.rehomed, 1)
+    assert.equal(result.orphaned, 1)
+
+    const projects = listProjects()
+    const shared = projects.find((candidate) => candidate.ref === sharedRef)
+    const privateProject = projects.find((candidate) => candidate.ref === privateRef)
+    assert.ok(shared)
+    assert.equal(shared.accountId, survivor.accountId)
+    assert.equal(shared.enabled, true)
+    assert.ok(privateProject)
+    assert.equal(privateProject.accountId, null)
+    assert.equal(privateProject.enabled, false)
+
+    assert.equal((database.prepare("SELECT COUNT(*) AS count FROM ping_runs WHERE project_ref = ?").get(sharedRef) as { count: number }).count, 1)
+    assert.equal((database.prepare("SELECT COUNT(*) AS count FROM ping_runs WHERE project_ref = ?").get(privateRef) as { count: number }).count, 1)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
 test("token rotation rejects an invalid token and replaces a valid one without losing projects or history", async () => {
   const originalFetch = globalThis.fetch
   const ref = "rotatedproject00001"
@@ -854,4 +1173,41 @@ test("rotates the encryption key and refuses when a token cannot be decrypted", 
 
   process.env.ENCRYPTION_KEY = previousKey
   rmSync(directory, { recursive: true, force: true })
+})
+
+test("backup script produces a valid SQLite database with the same account rows", async () => {
+  const { spawnSync } = await import("node:child_process")
+  const { default: Database } = await import("better-sqlite3")
+  const { migrate } = await import("../src/lib/db")
+  const directory = mkdtempSync(join(tmpdir(), "supaaction-backup-"))
+  const source = join(directory, "source.db")
+  const destination = join(directory, "backup.db")
+  try {
+    const database = new Database(source)
+    migrate(database)
+    const now = new Date().toISOString()
+    const insert = database.prepare(`INSERT INTO accounts
+      (id, label, encrypted_token, token_hint, status, last_synced_at, created_at, updated_at)
+      VALUES (?, ?, ?, ?, 'connected', ?, ?, ?)`)
+    insert.run("backup-acct-1", "Backup One", "ciphertext-1", "sbp_...1", now, now, now)
+    insert.run("backup-acct-2", "Backup Two", "ciphertext-2", "sbp_...2", now, now, now)
+    database.close()
+
+    const result = spawnSync(process.execPath, [join(process.cwd(), "scripts", "backup.mjs")], {
+      env: { ...process.env, DATABASE_PATH: source, BACKUP_PATH: destination },
+      encoding: "utf8",
+    })
+    assert.equal(result.status, 0, result.stderr || result.stdout)
+
+    const backup = new Database(destination, { readonly: true })
+    const rows = backup.prepare("SELECT id, label, encrypted_token, token_hint FROM accounts ORDER BY id")
+      .all() as Array<{ id: string; label: string; encrypted_token: string; token_hint: string }>
+    backup.close()
+    assert.deepEqual(rows, [
+      { id: "backup-acct-1", label: "Backup One", encrypted_token: "ciphertext-1", token_hint: "sbp_...1" },
+      { id: "backup-acct-2", label: "Backup Two", encrypted_token: "ciphertext-2", token_hint: "sbp_...2" },
+    ])
+  } finally {
+    rmSync(directory, { recursive: true, force: true })
+  }
 })
