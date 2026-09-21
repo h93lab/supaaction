@@ -6,7 +6,9 @@ import { recordAudit } from "@/lib/db"
 export async function POST(request: Request) {
   const originError = requireSameOrigin(request)
   if (originError) return originError
-  const clientKey = "admin-login"
+  const forwarded = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim()
+  const clientIp = forwarded || request.headers.get("x-real-ip")?.trim() || "unknown"
+  const clientKey = `ip:${clientIp}`
   const rateLimit = loginRateLimit(clientKey)
   if (!rateLimit.allowed) {
     return NextResponse.json({ error: "محاولات كثيرة. حاول مرة أخرى لاحقًا" }, {

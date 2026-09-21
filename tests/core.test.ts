@@ -204,6 +204,61 @@ test("restores a paused project once per cooldown window", async () => {
   }
 })
 
+test("parses the Retry-After header from seconds, HTTP dates and garbage", async () => {
+  const { parseRetryAfter } = await import("../src/lib/supabase-management")
+  assert.equal(parseRetryAfter("30"), 30)
+  const parsed = parseRetryAfter(new Date(Date.now() + 60_000).toUTCString())
+  assert.ok(typeof parsed === "number" && parsed >= 58 && parsed <= 61, `expected about 60, got ${parsed}`)
+  assert.equal(parseRetryAfter("not-a-date"), undefined)
+  assert.equal(parseRetryAfter(""), undefined)
+  assert.equal(parseRetryAfter(null), undefined)
+})
+
+test("rate limits failed logins per client IP", async () => {
+  const { clearFailedLogins, loginRateLimit, recordFailedLogin } = await import("../src/lib/auth")
+  clearFailedLogins("global")
+  clearFailedLogins("ip:1.2.3.4")
+  clearFailedLogins("ip:5.6.7.8")
+  for (let attempt = 0; attempt < 10; attempt += 1) recordFailedLogin("ip:1.2.3.4")
+  assert.equal(loginRateLimit("ip:1.2.3.4").allowed, false)
+  assert.equal(loginRateLimit("ip:5.6.7.8").allowed, true)
+  clearFailedLogins("ip:1.2.3.4")
+  clearFailedLogins("ip:5.6.7.8")
+  clearFailedLogins("global")
+})
+
+test("blocks logins globally after the backstop budget is exhausted", async () => {
+  const { clearFailedLogins, loginRateLimit, recordFailedLogin } = await import("../src/lib/auth")
+  clearFailedLogins("global")
+  for (let attempt = 0; attempt < 50; attempt += 1) recordFailedLogin(`ip:10.0.0.${attempt}`)
+  assert.equal(loginRateLimit("ip:10.0.0.250").allowed, false)
+  clearFailedLogins("global")
+  for (let attempt = 0; attempt < 50; attempt += 1) clearFailedLogins(`ip:10.0.0.${attempt}`)
+})
+
+test("rejects short secrets in production", async () => {
+  const env = process.env as Record<string, string | undefined>
+  const previousNodeEnv = env.NODE_ENV
+  const previousEncryptionKey = env.ENCRYPTION_KEY
+  const previousSessionSecret = env.SESSION_SECRET
+  const { encryptionKey, sessionSecret } = await import("../src/lib/env")
+  try {
+    env.NODE_ENV = "production"
+    env.ENCRYPTION_KEY = "short"
+    assert.throws(() => encryptionKey(), /at least 32 characters/)
+    env.ENCRYPTION_KEY = previousEncryptionKey
+    env.SESSION_SECRET = "short"
+    assert.throws(() => sessionSecret(), /at least 32 characters/)
+  } finally {
+    if (previousNodeEnv === undefined) delete env.NODE_ENV
+    else env.NODE_ENV = previousNodeEnv
+    if (previousEncryptionKey === undefined) delete env.ENCRYPTION_KEY
+    else env.ENCRYPTION_KEY = previousEncryptionKey
+    if (previousSessionSecret === undefined) delete env.SESSION_SECRET
+    else env.SESSION_SECRET = previousSessionSecret
+  }
+})
+
 test("re-checks a stored paused status before restoring", async () => {
   const originalFetch = globalThis.fetch
   const ref = "revivedproject0000001"

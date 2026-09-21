@@ -69,12 +69,24 @@ docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
 
 ## النسخ الاحتياطي والاستعادة
 
-كل البيانات موجودة في Docker volume باسم `supaaction-data`. لإنشاء نسخة احتياطية متسقة، أوقف الحاوية مؤقتًا ثم انسخ قاعدة البيانات:
+كل البيانات موجودة في قاعدة SQLite داخل volume باسم `supaaction-data`. يمكن إنشاء نسخة احتياطية متسقة دون إيقاف الحاوية، لأن SQLite تنسخ نفسها أثناء العمل:
 
 ```bash
-docker compose stop supaaction
-docker run --rm -v supaaction-data:/data -v "$PWD":/backup busybox cp /data/supaaction.db /backup/supaaction-backup.db
-docker compose start supaaction
+npm run backup
+```
+
+يفتح السكربت قاعدة البيانات للقراءة فقط وينفذ `VACUUM INTO`، لذلك لا يوجد توقف ولا خطر نسخة WAL ممزقة، ويرفض الكتابة فوق ملف موجود. مرر مسار الوجهة كأول وسيط أو عبر متغير `BACKUP_PATH`، وإلا فسيُنشأ ملف بتاريخ بجوار قاعدة البيانات.
+
+على السيرفر شغّله داخل الحاوية نفسها، فهي التي تملك Node وقاعدة البيانات:
+
+```bash
+docker compose exec supaaction node scripts/backup.mjs /data/supaaction-$(date +%F).db
+```
+
+ولنسخة يومية تلقائية، أضف السطر التالي إلى crontab على المضيف:
+
+```bash
+0 3 * * * cd /path/to/supaaction && docker compose exec -T supaaction node scripts/backup.mjs /data/supaaction-$(date +\%F).db
 ```
 
 احتفظ أيضًا بقيمة `ENCRYPTION_KEY` بأمان؛ بدونها لا يمكن فك تشفير التوكنات الموجودة في النسخة الاحتياطية.

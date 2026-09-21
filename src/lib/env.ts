@@ -1,8 +1,15 @@
 import { createHash } from "node:crypto"
 
+const MIN_SECRET_LENGTH = 32
+
 function requiredSecret(name: "APP_PASSWORD" | "SESSION_SECRET" | "ENCRYPTION_KEY") {
   const value = process.env[name]?.trim()
-  if (value) return value
+  if (value) {
+    if (process.env.NODE_ENV === "production" && name !== "APP_PASSWORD" && value.length < MIN_SECRET_LENGTH) {
+      throw new Error(`${name} must be at least ${MIN_SECRET_LENGTH} characters in production`)
+    }
+    return value
+  }
 
   if (process.env.NODE_ENV !== "production") {
     return `supaaction-development-only-${name.toLowerCase()}-change-me`

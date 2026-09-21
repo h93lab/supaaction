@@ -74,7 +74,11 @@ export async function pingOneProject(target: PingTarget, trigger: PingRunRecord[
         httpStatus = error instanceof SupabaseApiError ? error.status : null
         const retryable = !(error instanceof SupabaseApiError) || error.retryable
         if (!retryable || attempt >= settings.retryCount) break
-        await wait(settings.retryDelaySeconds * 1000 * (attempt + 1))
+        const ownDelaySeconds = settings.retryDelaySeconds * (attempt + 1)
+        const serverDelaySeconds = error instanceof SupabaseApiError && error.retryAfterSeconds !== undefined
+          ? Math.min(error.retryAfterSeconds, 120)
+          : 0
+        await wait(Math.max(ownDelaySeconds, serverDelaySeconds) * 1000)
       }
     }
   }

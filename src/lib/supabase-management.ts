@@ -12,10 +12,29 @@ export type SupabaseProject = {
 }
 
 export class SupabaseApiError extends Error {
-  constructor(message: string, public status: number | null, public retryable: boolean) {
+  constructor(
+    message: string,
+    public status: number | null,
+    public retryable: boolean,
+    public retryAfterSeconds?: number,
+  ) {
     super(message)
     this.name = "SupabaseApiError"
   }
+}
+
+export function parseRetryAfter(value: string | null): number | undefined {
+  if (!value) return undefined
+  const trimmed = value.trim()
+  if (!trimmed) return undefined
+  if (/^\d+$/.test(trimmed)) {
+    const seconds = Number(trimmed)
+    return Number.isFinite(seconds) ? seconds : undefined
+  }
+  const timestamp = Date.parse(trimmed)
+  if (Number.isNaN(timestamp)) return undefined
+  const seconds = Math.ceil((timestamp - Date.now()) / 1000)
+  return seconds > 0 ? seconds : undefined
 }
 
 async function managementRequest<T>(token: string, path: string, init: RequestInit = {}, timeoutSeconds = 20) {
@@ -40,7 +59,10 @@ async function managementRequest<T>(token: string, path: string, init: RequestIn
     if (!response.ok) {
       const detail = typeof data === "object" && data && "message" in data ? String(data.message) : String(data || response.statusText)
       const retryable = response.status === 429 || (response.status >= 500 && response.status !== 540)
-      throw new SupabaseApiError(detail, response.status, retryable)
+      const retryAfterSeconds = response.status === 429 || response.status === 503
+        ? parseRetryAfter(response.headers.get("retry-after"))
+        : undefined
+      throw new SupabaseApiError(detail, response.status, retryable, retryAfterSeconds)
     }
     return { data: data as T, status: response.status }
   } catch (error) {

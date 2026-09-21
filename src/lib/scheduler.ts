@@ -1,6 +1,6 @@
 import cron from "node-cron"
 import { syncAllAccounts } from "@/lib/accounts"
-import { acquireJobLock, getDb, getSettings, releaseJobLock, updateServiceHeartbeat } from "@/lib/db"
+import { acquireJobLock, getDb, getServiceHeartbeat, getSettings, releaseJobLock, updateServiceHeartbeat } from "@/lib/db"
 import { runDuePings } from "@/lib/pinger"
 
 declare global {
@@ -20,6 +20,21 @@ async function maybeSyncAccounts() {
   }
 }
 
+const CLEANUP_MARKER = "retention-cleanup"
+const CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000
+
+function maybeRunRetentionCleanup() {
+  const lastCleanup = getServiceHeartbeat(CLEANUP_MARKER)
+  const lastCleanupMs = lastCleanup ? Date.parse(lastCleanup) : Number.NaN
+  if (Number.isFinite(lastCleanupMs) && Date.now() - lastCleanupMs < CLEANUP_INTERVAL_MS) return
+  const database = getDb()
+  const retentionCutoff = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString()
+  database.prepare("DELETE FROM ping_runs WHERE started_at < ?").run(retentionCutoff)
+  const auditRetentionCutoff = new Date(Date.now() - 180 * 24 * 60 * 60 * 1000).toISOString()
+  database.prepare("DELETE FROM audit_logs WHERE created_at < ?").run(auditRetentionCutoff)
+  updateServiceHeartbeat(CLEANUP_MARKER)
+}
+
 export function startScheduler() {
   if (globalThis.__supaactionSchedulerStarted) return
   globalThis.__supaactionSchedulerStarted = true
@@ -30,10 +45,7 @@ export function startScheduler() {
     try {
       await maybeSyncAccounts()
       await runDuePings()
-      const retentionCutoff = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString()
-      getDb().prepare("DELETE FROM ping_runs WHERE started_at < ?").run(retentionCutoff)
-      const auditRetentionCutoff = new Date(Date.now() - 180 * 24 * 60 * 60 * 1000).toISOString()
-      getDb().prepare("DELETE FROM audit_logs WHERE created_at < ?").run(auditRetentionCutoff)
+      maybeRunRetentionCleanup()
     } catch (error) {
       console.error("[scheduler] tick failed", error)
     } finally {

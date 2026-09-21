@@ -6,6 +6,8 @@ import { appPassword, appUrl, sessionSecret, sessionTtlSeconds } from "@/lib/env
 const COOKIE_NAME = "supaaction_session"
 const LOGIN_WINDOW_MS = 15 * 60 * 1000
 const LOGIN_MAX_ATTEMPTS = 10
+const GLOBAL_LOGIN_MAX_ATTEMPTS = 50
+const GLOBAL_RATE_KEY = "global"
 type AdminAuthRow = { password_salt: string; password_hash: string; session_version: number }
 
 function sign(value: string) {
@@ -59,21 +61,30 @@ function getSessionVersion() {
   return getAdminAuth()?.session_version ?? 0
 }
 
-export function loginRateLimit(key: string) {
+function attemptState(key: string, maxAttempts: number) {
   const now = Date.now()
   const attempt = getDb().prepare("SELECT attempt_count, resets_at FROM auth_attempts WHERE key = ?").get(key) as
     { attempt_count: number; resets_at: number } | undefined
   if (!attempt || attempt.resets_at <= now) {
-    getDb().prepare("DELETE FROM auth_attempts WHERE key = ? OR resets_at <= ?").run(key, now)
+    getDb().prepare("DELETE FROM auth_attempts WHERE key = ?").run(key)
     return { allowed: true, retryAfterSeconds: 0 }
   }
   return {
-    allowed: attempt.attempt_count < LOGIN_MAX_ATTEMPTS,
+    allowed: attempt.attempt_count < maxAttempts,
     retryAfterSeconds: Math.ceil((attempt.resets_at - now) / 1000),
   }
 }
 
-export function recordFailedLogin(key: string) {
+export function loginRateLimit(key: string) {
+  getDb().prepare("DELETE FROM auth_attempts WHERE resets_at <= ?").run(Date.now())
+  const perClient = attemptState(key, LOGIN_MAX_ATTEMPTS)
+  if (!perClient.allowed) return perClient
+  const global = attemptState(GLOBAL_RATE_KEY, GLOBAL_LOGIN_MAX_ATTEMPTS)
+  if (!global.allowed) return global
+  return { allowed: true, retryAfterSeconds: 0 }
+}
+
+function incrementFailedLogin(key: string) {
   const now = Date.now()
   getDb().prepare(`
     INSERT INTO auth_attempts (key, attempt_count, resets_at) VALUES (?, 1, ?)
@@ -81,6 +92,11 @@ export function recordFailedLogin(key: string) {
       attempt_count = CASE WHEN auth_attempts.resets_at <= ? THEN 1 ELSE auth_attempts.attempt_count + 1 END,
       resets_at = CASE WHEN auth_attempts.resets_at <= ? THEN excluded.resets_at ELSE auth_attempts.resets_at END
   `).run(key, now + LOGIN_WINDOW_MS, now, now)
+}
+
+export function recordFailedLogin(key: string) {
+  incrementFailedLogin(key)
+  incrementFailedLogin(GLOBAL_RATE_KEY)
 }
 
 export function clearFailedLogins(key: string) {
