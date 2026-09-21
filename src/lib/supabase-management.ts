@@ -66,3 +66,14 @@ export async function queryProject(token: string, ref: string, timeoutSeconds: n
     body: JSON.stringify({ query: "select 1 as supaaction_ping", parameters: [] }),
   }, timeoutSeconds)
 }
+
+export async function fetchProject(token: string, ref: string, timeoutSeconds: number) {
+  return managementRequest<SupabaseProject>(token, `/projects/${encodeURIComponent(ref)}`, {}, timeoutSeconds)
+}
+
+export async function restoreProject(token: string, ref: string, timeoutSeconds: number) {
+  return managementRequest<unknown>(token, `/projects/${encodeURIComponent(ref)}/restore`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  }, timeoutSeconds)
+}

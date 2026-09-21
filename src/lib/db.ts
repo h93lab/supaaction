@@ -40,6 +40,9 @@ function migrate(database: Db) {
       last_http_status INTEGER,
       last_error TEXT,
       next_ping_at TEXT,
+      fail_streak INTEGER NOT NULL DEFAULT 0,
+      last_restore_at TEXT,
+      restore_count INTEGER NOT NULL DEFAULT 0,
       remote_created_at TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
@@ -108,6 +111,18 @@ function migrate(database: Db) {
     CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at DESC);
     INSERT OR IGNORE INTO settings (id) VALUES (1);
   `)
+
+  const projectColumns = new Set(
+    (database.prepare("PRAGMA table_info(projects)").all() as Array<{ name: string }>).map((column) => column.name),
+  )
+  const addedColumns: Array<[string, string]> = [
+    ["fail_streak", "INTEGER NOT NULL DEFAULT 0"],
+    ["last_restore_at", "TEXT"],
+    ["restore_count", "INTEGER NOT NULL DEFAULT 0"],
+  ]
+  for (const [name, definition] of addedColumns) {
+    if (!projectColumns.has(name)) database.exec(`ALTER TABLE projects ADD COLUMN ${name} ${definition}`)
+  }
 }
 
 export function getDb() {
@@ -127,7 +142,8 @@ type ProjectRow = {
   ref: string; account_id: string; account_label: string; name: string; organization_id: string | null
   organization_slug: string | null; region: string | null; remote_status: string; enabled: number
   last_ping_at: string | null; last_ping_status: ProjectRecord["lastPingStatus"]; last_latency_ms: number | null
-  last_http_status: number | null; last_error: string | null; next_ping_at: string | null; created_at: string
+  last_http_status: number | null; last_error: string | null; next_ping_at: string | null
+  fail_streak: number; last_restore_at: string | null; restore_count: number; created_at: string
 }
 
 function mapProject(row: ProjectRow): ProjectRecord {
@@ -137,6 +153,7 @@ function mapProject(row: ProjectRow): ProjectRecord {
     remoteStatus: row.remote_status, enabled: Boolean(row.enabled), lastPingAt: row.last_ping_at,
     lastPingStatus: row.last_ping_status, lastLatencyMs: row.last_latency_ms,
     lastHttpStatus: row.last_http_status, lastError: row.last_error, nextPingAt: row.next_ping_at,
+    failStreak: row.fail_streak, lastRestoreAt: row.last_restore_at, restoreCount: row.restore_count,
     createdAt: row.created_at,
   }
 }

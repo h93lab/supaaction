@@ -25,6 +25,9 @@ export type ProjectRecord = {
   lastHttpStatus: number | null
   lastError: string | null
   nextPingAt: string | null
+  failStreak: number
+  lastRestoreAt: string | null
+  restoreCount: number
   createdAt: string
 }
 
