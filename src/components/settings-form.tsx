@@ -1,7 +1,7 @@
 "use client"
 
 import { useState } from "react"
-import { Save } from "lucide-react"
+import { KeyRound, Save } from "lucide-react"
 import { toast } from "sonner"
 import { ChangePasswordForm } from "@/components/change-password-form"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
@@ -13,7 +13,7 @@ import { Switch } from "@/components/ui/switch"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import type { AppSettings } from "@/lib/types"
 
-export function SettingsForm({ initial }: { initial: AppSettings }) {
+export function SettingsForm({ initial, initialTab = "schedule" }: { initial: AppSettings; initialTab?: "schedule" | "security" }) {
   const [settings, setSettings] = useState(initial)
   const [pending, setPending] = useState(false)
 
@@ -42,10 +42,10 @@ export function SettingsForm({ initial }: { initial: AppSettings }) {
   }
 
   return (
-    <Tabs defaultValue="schedule" className="space-y-6">
+    <Tabs defaultValue={initialTab} className="space-y-6">
       <TabsList aria-label="أقسام الإعدادات">
         <TabsTrigger value="schedule">الجدولة</TabsTrigger>
-        <TabsTrigger value="security">الأمان</TabsTrigger>
+        <TabsTrigger value="security"><KeyRound className="size-4" />كلمة المرور والأمان</TabsTrigger>
       </TabsList>
 
       <TabsContent value="schedule">
