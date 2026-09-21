@@ -1,12 +1,30 @@
 import { createHash } from "node:crypto"
 
 const MIN_SECRET_LENGTH = 32
+const MIN_APP_PASSWORD_LENGTH = 12
+const SAMPLE_APP_PASSWORD = "change-this-admin-password"
+
+export class AppPasswordConfigError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = "AppPasswordConfigError"
+  }
+}
 
 function requiredSecret(name: "APP_PASSWORD" | "SESSION_SECRET" | "ENCRYPTION_KEY") {
   const value = process.env[name]?.trim()
   if (value) {
-    if (process.env.NODE_ENV === "production" && name !== "APP_PASSWORD" && value.length < MIN_SECRET_LENGTH) {
-      throw new Error(`${name} must be at least ${MIN_SECRET_LENGTH} characters in production`)
+    if (process.env.NODE_ENV === "production") {
+      if (name === "APP_PASSWORD") {
+        if (value.length < MIN_APP_PASSWORD_LENGTH) {
+          throw new AppPasswordConfigError(`APP_PASSWORD must be at least ${MIN_APP_PASSWORD_LENGTH} characters in production`)
+        }
+        if (value === SAMPLE_APP_PASSWORD) {
+          throw new AppPasswordConfigError(`APP_PASSWORD must be changed from the sample value "${SAMPLE_APP_PASSWORD}" in production`)
+        }
+      } else if (value.length < MIN_SECRET_LENGTH) {
+        throw new Error(`${name} must be at least ${MIN_SECRET_LENGTH} characters in production`)
+      }
     }
     return value
   }
@@ -46,4 +64,8 @@ export function sessionTtlSeconds() {
 
 export function schedulerEnabled() {
   return process.env.SCHEDULER_ENABLED?.trim().toLowerCase() !== "false"
+}
+
+export function trustedProxy() {
+  return process.env.TRUSTED_PROXY?.trim().toLowerCase() === "true"
 }
