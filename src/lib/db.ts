@@ -189,11 +189,29 @@ function rebuildProjectsAccountLink(database: Db) {
   }
 }
 
+// The image runs as uid 1001, so a bind-mounted data directory owned by anyone else fails here with a
+// bare SQLITE_CANTOPEN. Say what is wrong instead: the worker dies on this and the UI keeps serving,
+// so the operator sees a working app with no protection behind it.
+function openDatabase(file: string) {
+  const directory = path.dirname(file)
+  try {
+    fs.mkdirSync(directory, { recursive: true })
+    return new Database(file)
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code !== "EACCES" && code !== "EPERM" && code !== "SQLITE_CANTOPEN") throw error
+    throw new Error(
+      `Cannot open the SQLite database at ${file}. The container runs as uid 1001, so the data directory must be writable by it: ` +
+      `sudo mkdir -p ${directory} && sudo chown 1001:1001 ${directory} && sudo chmod 750 ${directory}`,
+      { cause: error },
+    )
+  }
+}
+
 export function getDb() {
   if (globalThis.__supaactionDb) return globalThis.__supaactionDb
   const file = path.resolve(databasePath())
-  fs.mkdirSync(path.dirname(file), { recursive: true })
-  const database = new Database(file)
+  const database = openDatabase(file)
   database.pragma("journal_mode = WAL")
   database.pragma("foreign_keys = ON")
   database.pragma("busy_timeout = 5000")

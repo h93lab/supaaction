@@ -1,3 +1,6 @@
+# The bind-mounted data directory must be writable by uid 1001 (the image's `nextjs` user), otherwise the
+# worker dies with SQLITE_CANTOPEN while the web container keeps serving:
+#   sudo mkdir -p /srv/storage/supaaction/data && sudo chown 1001:1001 /srv/storage/supaaction/data
 services:
   supaaction:
     build:

@@ -66,11 +66,16 @@ docker compose ps
 
 افتح `http://localhost:3000` وسجل الدخول باستخدام `APP_PASSWORD`.
 
-للنشر على السيرفر باستخدام ملف الإنتاج المنفصل:
+للنشر على السيرفر باستخدام ملف الإنتاج المنفصل. **جهّز مسار البيانات أولًا:** الحاوية تعمل بالمستخدم `uid 1001`، وإذا كان المجلد مملوكًا لغيره يفشل الـ Worker بخطأ `SQLITE_CANTOPEN` بينما تستمر واجهة الويب في العمل — أي تطبيق يبدو سليمًا بلا حماية خلفه:
 
 ```bash
+sudo mkdir -p /srv/storage/supaaction/data
+sudo chown 1001:1001 /srv/storage/supaaction/data
+sudo chmod 750 /srv/storage/supaaction/data
 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
 ```
+
+ثم تأكد من `docker compose ps` أن `supaaction-worker` يظهر بحالة `healthy`.
 
 يمكن تخصيص عنوان الربط والمنفذ ومسار البيانات عبر `SUPAACTION_BIND_ADDRESS` و`SUPAACTION_PORT` و`SUPAACTION_DATA_PATH`.
 
