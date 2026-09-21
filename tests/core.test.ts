@@ -248,13 +248,156 @@ test("rate limits failed logins per client IP", async () => {
   clearFailedLogins("global")
 })
 
-test("blocks logins globally after the backstop budget is exhausted", async () => {
-  const { clearFailedLogins, loginRateLimit, recordFailedLogin } = await import("../src/lib/auth")
-  clearFailedLogins("global")
-  for (let attempt = 0; attempt < 50; attempt += 1) recordFailedLogin(`ip:10.0.0.${attempt}`)
-  assert.equal(loginRateLimit("ip:10.0.0.250").allowed, false)
-  clearFailedLogins("global")
-  for (let attempt = 0; attempt < 50; attempt += 1) clearFailedLogins(`ip:10.0.0.${attempt}`)
+test("blocks logins after the per-client budget is exhausted", async () => {
+  const { chargeLoginAttempt, clearFailedLogins } = await import("../src/lib/auth")
+  const key = "charge-test-client"
+  clearFailedLogins(key)
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    assert.equal(chargeLoginAttempt(key).allowed, true)
+  }
+  assert.equal(chargeLoginAttempt(key).allowed, false)
+  clearFailedLogins(key)
+})
+
+test("rejects verifications beyond the in-flight cap without hashing", async () => {
+  const { acquireVerificationSlot, clearFailedLogins, releaseVerificationSlot } = await import("../src/lib/auth")
+  const { getDb } = await import("../src/lib/db")
+  const { POST } = await import("../src/app/api/auth/login/route")
+  clearFailedLogins("direct")
+  assert.equal(acquireVerificationSlot(), true)
+  assert.equal(acquireVerificationSlot(), true)
+  try {
+    const response = await POST(new Request("https://supa.example.test/api/auth/login", {
+      method: "POST",
+      headers: { origin: "https://supa.example.test", "content-type": "application/json" },
+      body: JSON.stringify({ password: "anything" }),
+    }))
+    assert.equal(response.status, 429)
+    assert.equal(typeof response.headers.get("Retry-After"), "string")
+    const charged = (getDb().prepare("SELECT attempt_count FROM auth_attempts WHERE key = ?").get("direct") as { attempt_count: number } | undefined)?.attempt_count ?? 0
+    assert.equal(charged, 0)
+  } finally {
+    releaseVerificationSlot()
+    releaseVerificationSlot()
+  }
+})
+
+test("maps forwarded headers to a rate-limit key only behind a trusted proxy", async () => {
+  const env = process.env as Record<string, string | undefined>
+  const previousTrustedProxy = env.TRUSTED_PROXY
+  const { loginRateLimitKey } = await import("../src/lib/auth")
+  try {
+    delete env.TRUSTED_PROXY
+    const directA = loginRateLimitKey(new Request("https://supa.example.test/api/auth/login", {
+      headers: { "x-forwarded-for": "1.2.3.4" },
+    }))
+    const directB = loginRateLimitKey(new Request("https://supa.example.test/api/auth/login", {
+      headers: { "x-forwarded-for": "5.6.7.8" },
+    }))
+    assert.equal(directA, directB)
+    assert.equal(directA, "direct")
+
+    env.TRUSTED_PROXY = "true"
+    const proxiedA = loginRateLimitKey(new Request("https://supa.example.test/api/auth/login", {
+      headers: { "x-forwarded-for": "1.2.3.4" },
+    }))
+    const proxiedB = loginRateLimitKey(new Request("https://supa.example.test/api/auth/login", {
+      headers: { "x-forwarded-for": "5.6.7.8" },
+    }))
+    assert.notEqual(proxiedA, proxiedB)
+  } finally {
+    if (previousTrustedProxy === undefined) delete env.TRUSTED_PROXY
+    else env.TRUSTED_PROXY = previousTrustedProxy
+  }
+})
+
+test("keeps verifying the unidentifiable direct key instead of hard-denying", async () => {
+  const env = process.env as Record<string, string | undefined>
+  const previousTrustedProxy = env.TRUSTED_PROXY
+  const { clearFailedLogins, isDirectRateLimitKey, loginSlowdownMs } = await import("../src/lib/auth")
+  const { POST } = await import("../src/app/api/auth/login/route")
+  try {
+    delete env.TRUSTED_PROXY
+    clearFailedLogins("direct")
+    assert.equal(isDirectRateLimitKey("direct"), true)
+    assert.equal(loginSlowdownMs(), 1000)
+    const attempt = () => POST(new Request("https://supa.example.test/api/auth/login", {
+      method: "POST",
+      headers: { origin: "https://supa.example.test", "content-type": "application/json" },
+      body: JSON.stringify({ password: "wrong-password" }),
+    }))
+    for (let index = 0; index < 10; index += 1) {
+      assert.equal((await attempt()).status, 401)
+    }
+    const eleventh = await attempt()
+    assert.equal(eleventh.status, 401)
+  } finally {
+    clearFailedLogins("direct")
+    if (previousTrustedProxy === undefined) delete env.TRUSTED_PROXY
+    else env.TRUSTED_PROXY = previousTrustedProxy
+  }
+})
+
+test("hard-denies an identifiable client IP at the per-key budget", async () => {
+  const env = process.env as Record<string, string | undefined>
+  const previousTrustedProxy = env.TRUSTED_PROXY
+  const { clearFailedLogins } = await import("../src/lib/auth")
+  const { POST } = await import("../src/app/api/auth/login/route")
+  try {
+    env.TRUSTED_PROXY = "true"
+    clearFailedLogins("ip:9.9.9.9")
+    const attempt = () => POST(new Request("https://supa.example.test/api/auth/login", {
+      method: "POST",
+      headers: { origin: "https://supa.example.test", "content-type": "application/json", "x-forwarded-for": "9.9.9.9" },
+      body: JSON.stringify({ password: "wrong-password" }),
+    }))
+    for (let index = 0; index < 10; index += 1) {
+      assert.equal((await attempt()).status, 401)
+    }
+    const eleventh = await attempt()
+    assert.equal(eleventh.status, 429)
+    assert.equal(typeof eleventh.headers.get("Retry-After"), "string")
+  } finally {
+    clearFailedLogins("ip:9.9.9.9")
+    if (previousTrustedProxy === undefined) delete env.TRUSTED_PROXY
+    else env.TRUSTED_PROXY = previousTrustedProxy
+  }
+})
+
+test("returns 503 for a misconfigured production admin password", async () => {
+  const env = process.env as Record<string, string | undefined>
+  const previousNodeEnv = env.NODE_ENV
+  const previousAppPassword = env.APP_PASSWORD
+  const { clearFailedLogins } = await import("../src/lib/auth")
+  const { getDb } = await import("../src/lib/db")
+  const { POST } = await import("../src/app/api/auth/login/route")
+  const database = getDb()
+  const previousAuth = database.prepare("SELECT password_salt, password_hash, session_version FROM admin_auth WHERE id = 1")
+    .get() as { password_salt: string; password_hash: string; session_version: number } | undefined
+  try {
+    database.prepare("DELETE FROM admin_auth").run()
+    clearFailedLogins("direct")
+    env.NODE_ENV = "production"
+    env.APP_PASSWORD = "short"
+    const response = await POST(new Request("https://supa.example.test/api/auth/login", {
+      method: "POST",
+      headers: { origin: "https://supa.example.test", "content-type": "application/json" },
+      body: JSON.stringify({ password: "anything" }),
+    }))
+    assert.equal(response.status, 503)
+    const body = await response.json() as { error: string }
+    assert.equal(body.error.includes("APP_PASSWORD"), true)
+  } finally {
+    if (previousAuth) {
+      database.prepare("UPDATE admin_auth SET password_salt = ?, password_hash = ?, session_version = ? WHERE id = 1")
+        .run(previousAuth.password_salt, previousAuth.password_hash, previousAuth.session_version)
+    }
+    clearFailedLogins("direct")
+    if (previousNodeEnv === undefined) delete env.NODE_ENV
+    else env.NODE_ENV = previousNodeEnv
+    if (previousAppPassword === undefined) delete env.APP_PASSWORD
+    else env.APP_PASSWORD = previousAppPassword
+  }
 })
 
 test("rejects short secrets in production", async () => {
@@ -277,6 +420,25 @@ test("rejects short secrets in production", async () => {
     else env.ENCRYPTION_KEY = previousEncryptionKey
     if (previousSessionSecret === undefined) delete env.SESSION_SECRET
     else env.SESSION_SECRET = previousSessionSecret
+  }
+})
+
+test("rejects the sample admin password in production", async () => {
+  const env = process.env as Record<string, string | undefined>
+  const previousNodeEnv = env.NODE_ENV
+  const previousAppPassword = env.APP_PASSWORD
+  const { appPassword } = await import("../src/lib/env")
+  try {
+    env.NODE_ENV = "production"
+    env.APP_PASSWORD = "change-this-admin-password"
+    assert.throws(() => appPassword(), /change-this-admin-password/)
+    env.APP_PASSWORD = "a-strong-password-long-enough"
+    assert.equal(appPassword(), "a-strong-password-long-enough")
+  } finally {
+    if (previousNodeEnv === undefined) delete env.NODE_ENV
+    else env.NODE_ENV = previousNodeEnv
+    if (previousAppPassword === undefined) delete env.APP_PASSWORD
+    else env.APP_PASSWORD = previousAppPassword
   }
 })
 

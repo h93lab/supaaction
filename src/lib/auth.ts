@@ -1,13 +1,15 @@
 import { createHmac, randomBytes, scryptSync, timingSafeEqual } from "node:crypto"
 import { cookies } from "next/headers"
 import { getDb } from "@/lib/db"
-import { appPassword, appUrl, sessionSecret, sessionTtlSeconds } from "@/lib/env"
+import { appPassword, appUrl, sessionSecret, sessionTtlSeconds, trustedProxy } from "@/lib/env"
 
 const COOKIE_NAME = "supaaction_session"
 const LOGIN_WINDOW_MS = 15 * 60 * 1000
 const LOGIN_MAX_ATTEMPTS = 10
-const GLOBAL_LOGIN_MAX_ATTEMPTS = 50
-const GLOBAL_RATE_KEY = "global"
+const MAX_IN_FLIGHT_VERIFICATIONS = 2
+const DIRECT_RATE_KEY = "direct"
+const LOGIN_SLOWDOWN_MS = 1000
+let inFlightVerifications = 0
 type AdminAuthRow = { password_salt: string; password_hash: string; session_version: number }
 
 function sign(value: string) {
@@ -77,10 +79,23 @@ function attemptState(key: string, maxAttempts: number) {
 
 export function loginRateLimit(key: string) {
   getDb().prepare("DELETE FROM auth_attempts WHERE resets_at <= ?").run(Date.now())
-  const perClient = attemptState(key, LOGIN_MAX_ATTEMPTS)
-  if (!perClient.allowed) return perClient
-  const global = attemptState(GLOBAL_RATE_KEY, GLOBAL_LOGIN_MAX_ATTEMPTS)
-  if (!global.allowed) return global
+  return attemptState(key, LOGIN_MAX_ATTEMPTS)
+}
+
+export function chargeLoginAttempt(key: string) {
+  const now = Date.now()
+  const db = getDb()
+  db.prepare("DELETE FROM auth_attempts WHERE key = ? AND resets_at <= ?").run(key, now)
+  const row = db.prepare("SELECT attempt_count, resets_at FROM auth_attempts WHERE key = ?").get(key) as
+    { attempt_count: number; resets_at: number } | undefined
+  if ((row?.attempt_count ?? 0) >= LOGIN_MAX_ATTEMPTS) {
+    return { allowed: false, retryAfterSeconds: Math.ceil(((row?.resets_at ?? now) - now) / 1000) }
+  }
+  if (row) {
+    db.prepare("UPDATE auth_attempts SET attempt_count = attempt_count + 1 WHERE key = ?").run(key)
+  } else {
+    db.prepare("INSERT INTO auth_attempts (key, attempt_count, resets_at) VALUES (?, 1, ?)").run(key, now + LOGIN_WINDOW_MS)
+  }
   return { allowed: true, retryAfterSeconds: 0 }
 }
 
@@ -96,11 +111,39 @@ function incrementFailedLogin(key: string) {
 
 export function recordFailedLogin(key: string) {
   incrementFailedLogin(key)
-  incrementFailedLogin(GLOBAL_RATE_KEY)
 }
 
 export function clearFailedLogins(key: string) {
   getDb().prepare("DELETE FROM auth_attempts WHERE key = ?").run(key)
+}
+
+export function acquireVerificationSlot() {
+  if (inFlightVerifications >= MAX_IN_FLIGHT_VERIFICATIONS) return false
+  inFlightVerifications += 1
+  return true
+}
+
+export function releaseVerificationSlot() {
+  if (inFlightVerifications > 0) inFlightVerifications -= 1
+}
+
+export function isDirectRateLimitKey(key: string) {
+  return key === DIRECT_RATE_KEY
+}
+
+export function loginSlowdownMs() {
+  return LOGIN_SLOWDOWN_MS
+}
+
+export function loginSlowdown() {
+  return new Promise<void>((resolve) => setTimeout(resolve, loginSlowdownMs()))
+}
+
+export function loginRateLimitKey(request: Request) {
+  if (!trustedProxy()) return DIRECT_RATE_KEY
+  const forwarded = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim()
+  const realIp = request.headers.get("x-real-ip")?.trim()
+  return `ip:${forwarded || realIp || "unknown"}`
 }
 
 export function createSessionToken() {
