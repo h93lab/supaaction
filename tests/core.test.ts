@@ -1211,3 +1211,41 @@ test("backup script produces a valid SQLite database with the same account rows"
     rmSync(directory, { recursive: true, force: true })
   }
 })
+
+test("runs retention cleanup at most once a day and only past the window", async () => {
+  const { getDb, updateServiceHeartbeat } = await import("../src/lib/db")
+  const { maybeRunRetentionCleanup } = await import("../src/lib/scheduler")
+  const database = getDb()
+  const now = Date.now()
+  const iso = (msAgo: number) => new Date(now - msAgo).toISOString()
+  const day = 24 * 60 * 60 * 1000
+
+  database.prepare("DELETE FROM ping_runs").run()
+  database.prepare("DELETE FROM audit_logs").run()
+  database.prepare("DELETE FROM service_status WHERE name = 'retention-cleanup'").run()
+  database.prepare("INSERT OR IGNORE INTO accounts (id, label, encrypted_token, token_hint, created_at, updated_at) VALUES ('ret-acct', 'Retention', 'cipher', 'hint', ?, ?)").run(iso(0), iso(0))
+  database.prepare("INSERT OR IGNORE INTO projects (ref, account_id, name, created_at, updated_at) VALUES ('ret-ref', 'ret-acct', 'Retention', ?, ?)").run(iso(0), iso(0))
+  const insertRun = database.prepare("INSERT INTO ping_runs (id, project_ref, started_at, status) VALUES (?, 'ret-ref', ?, 'success')")
+  insertRun.run("run-old", iso(91 * day))
+  insertRun.run("run-recent", iso(89 * day))
+  const insertAudit = database.prepare("INSERT INTO audit_logs (id, action, target_type, target_id, summary, created_at) VALUES (?, 'test', 'project', 'ret-ref', 'summary', ?)")
+  insertAudit.run("audit-old", iso(181 * day))
+  insertAudit.run("audit-recent", iso(179 * day))
+
+  maybeRunRetentionCleanup()
+  const runIds = () => (database.prepare("SELECT id FROM ping_runs ORDER BY id").all() as Array<{ id: string }>).map((row) => row.id)
+  const auditIds = () => (database.prepare("SELECT id FROM audit_logs ORDER BY id").all() as Array<{ id: string }>).map((row) => row.id)
+  assert.deepEqual(runIds(), ["run-recent"])
+  assert.deepEqual(auditIds(), ["audit-recent"])
+
+  // A second call within 24h must not delete anything, even once rows age past the window.
+  insertRun.run("run-old-again", iso(91 * day))
+  maybeRunRetentionCleanup()
+  assert.deepEqual(runIds(), ["run-old-again", "run-recent"])
+
+  // Once the marker is older than a day, cleanup runs again.
+  updateServiceHeartbeat("retention-cleanup")
+  database.prepare("UPDATE service_status SET last_heartbeat_at = ? WHERE name = 'retention-cleanup'").run(iso(day + 60_000))
+  maybeRunRetentionCleanup()
+  assert.deepEqual(runIds(), ["run-recent"])
+})

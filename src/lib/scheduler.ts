@@ -23,7 +23,7 @@ async function maybeSyncAccounts() {
 const CLEANUP_MARKER = "retention-cleanup"
 const CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000
 
-function maybeRunRetentionCleanup() {
+export function maybeRunRetentionCleanup() {
   const lastCleanup = getServiceHeartbeat(CLEANUP_MARKER)
   const lastCleanupMs = lastCleanup ? Date.parse(lastCleanup) : Number.NaN
   if (Number.isFinite(lastCleanupMs) && Date.now() - lastCleanupMs < CLEANUP_INTERVAL_MS) return
