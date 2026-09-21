@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto"
 import { decryptSecret, encryptSecret, tokenHint } from "@/lib/crypto"
 import { getDb } from "@/lib/db"
 import { fetchSupabaseProjects } from "@/lib/supabase-management"
+import type { AccountDeletionResult } from "@/lib/types"
 
 export async function addAccount(label: string, token: string) {
   const projects = await fetchSupabaseProjects(token)
@@ -32,6 +33,7 @@ function upsertProjects(accountId: string, projects: Awaited<ReturnType<typeof f
       remote_status = excluded.remote_status, remote_created_at = excluded.remote_created_at,
       updated_at = excluded.updated_at
   `)
+  const recordVisibility = database.prepare("INSERT OR IGNORE INTO project_accounts (project_ref, account_id) VALUES (?, ?)")
   for (const project of projects) {
     statement.run({
       ref: project.ref, accountId, name: project.name, organizationId: project.organization_id ?? null,
@@ -39,6 +41,7 @@ function upsertProjects(accountId: string, projects: Awaited<ReturnType<typeof f
       status: project.status ?? "UNKNOWN", nextPingAt: now, remoteCreatedAt: project.created_at ?? null,
       createdAt: now, updatedAt: now,
     })
+    recordVisibility.run(project.ref, accountId)
   }
 }
 
@@ -74,8 +77,45 @@ export async function syncAllAccounts() {
   return results
 }
 
-export function deleteAccount(accountId: string) {
-  return getDb().prepare("DELETE FROM accounts WHERE id = ?").run(accountId).changes > 0
+export function deleteAccount(accountId: string): AccountDeletionResult {
+  const database = getDb()
+  const account = database.prepare("SELECT id FROM accounts WHERE id = ?").get(accountId) as { id: string } | undefined
+  if (!account) return { deleted: false, projects: 0, runs: 0, rehomed: 0, orphaned: 0 }
+
+  const ownedRefs = database.prepare("SELECT ref FROM projects WHERE account_id = ?").all(accountId) as Array<{ ref: string }>
+  const runCount = ownedRefs.length === 0
+    ? 0
+    : Number((database.prepare(`SELECT COUNT(*) AS count FROM ping_runs WHERE project_ref IN (${ownedRefs.map(() => "?").join(", ")})`).get(...ownedRefs.map((project) => project.ref)) as { count: number }).count)
+
+  let rehomed = 0
+  let orphaned = 0
+  const now = new Date().toISOString()
+  database.transaction(() => {
+    for (const { ref } of ownedRefs) {
+      const survivor = database.prepare("SELECT account_id FROM project_accounts WHERE project_ref = ? AND account_id <> ? LIMIT 1").get(ref, accountId) as { account_id: string } | undefined
+      if (survivor) {
+        rehomed += 1
+        database.prepare("UPDATE projects SET account_id = ?, updated_at = ? WHERE ref = ?").run(survivor.account_id, now, ref)
+      } else {
+        orphaned += 1
+        database.prepare("UPDATE projects SET account_id = NULL, enabled = 0, updated_at = ? WHERE ref = ?").run(now, ref)
+      }
+    }
+    database.prepare("DELETE FROM accounts WHERE id = ?").run(accountId)
+  })()
+
+  return { deleted: true, projects: ownedRefs.length, runs: runCount, rehomed, orphaned }
+}
+
+export async function rotateAccountToken(accountId: string, token: string) {
+  await fetchSupabaseProjects(token)
+  const database = getDb()
+  const account = database.prepare("SELECT id FROM accounts WHERE id = ?").get(accountId) as { id: string } | undefined
+  if (!account) throw new Error("Account not found")
+  const now = new Date().toISOString()
+  database.prepare("UPDATE accounts SET encrypted_token = ?, token_hint = ?, status = 'connected', last_error = NULL, last_synced_at = ?, updated_at = ? WHERE id = ?")
+    .run(encryptSecret(token), tokenHint(token), now, now, accountId)
+  return { accountId }
 }
 
 export function getAccountToken(accountId: string) {

@@ -11,7 +11,7 @@ export type AccountRecord = {
 
 export type ProjectRecord = {
   ref: string
-  accountId: string
+  accountId: string | null
   accountLabel: string
   name: string
   organizationId: string | null
@@ -55,6 +55,17 @@ export type AppSettings = {
   autoSync: boolean
   syncIntervalHours: number
   timezone: string
+}
+
+export type AccountDeletionImpact = {
+  projects: number
+  runs: number
+  rehomed: number
+  orphaned: number
+}
+
+export type AccountDeletionResult = AccountDeletionImpact & {
+  deleted: boolean
 }
 
 export type AuditLogRecord = {

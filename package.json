@@ -14,7 +14,8 @@
     "test:coverage": "node --test --experimental-test-coverage --test-coverage-lines=85 --test-coverage-functions=75 --test-coverage-branches=65 --import tsx tests/**/*.test.ts",
     "check": "npm run lint && npm run typecheck && npm test && npm run build",
     "generate-secrets": "node scripts/generate-secrets.mjs",
-    "backup": "node scripts/backup.mjs"
+    "backup": "node scripts/backup.mjs",
+    "rotate-key": "node scripts/rotate-encryption-key.mjs"
   },
   "dependencies": {
     "better-sqlite3": "12.4.1",

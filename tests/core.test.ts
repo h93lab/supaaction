@@ -582,3 +582,234 @@ test("re-checks a stored paused status before restoring", async () => {
     globalThis.fetch = originalFetch
   }
 })
+
+test("deleting one account preserves a project seen by another account and its history", async () => {
+  const originalFetch = globalThis.fetch
+  const ref = "sharedprojectref0001"
+  globalThis.fetch = async (input) => {
+    if (String(input).endsWith("/projects")) {
+      return new Response(JSON.stringify([{ ref, name: "Shared", status: "ACTIVE_HEALTHY" }]), { status: 200 })
+    }
+    return new Response("not found", { status: 404 })
+  }
+  try {
+    const { addAccount, deleteAccount } = await import("../src/lib/accounts")
+    const { getDb, listProjects } = await import("../src/lib/db")
+    const first = await addAccount("First", "sbp_token_first_123456789")
+    const second = await addAccount("Second", "sbp_token_second_12345678")
+    const database = getDb()
+    database.prepare(`INSERT INTO ping_runs (id, project_ref, started_at, completed_at, status, latency_ms, http_status, attempt_count, trigger)
+      VALUES (?, ?, ?, ?, 'success', 12, 200, 1, 'manual')`)
+      .run("run-shared", ref, new Date().toISOString(), new Date().toISOString())
+
+    const result = deleteAccount(second.accountId)
+    assert.equal(result.deleted, true)
+    assert.equal(result.rehomed, 1)
+    assert.equal(result.orphaned, 0)
+
+    const project = listProjects().find((candidate) => candidate.ref === ref)
+    assert.ok(project)
+    assert.equal(project.accountId, first.accountId)
+    assert.equal(project.enabled, true)
+
+    const run = database.prepare("SELECT COUNT(*) AS count FROM ping_runs WHERE project_ref = ?").get(ref) as { count: number }
+    assert.equal(run.count, 1)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test("deleting the only account that can see a project orphans and disables it, keeping its history", async () => {
+  const originalFetch = globalThis.fetch
+  const ref = "lonelyprojectref001"
+  globalThis.fetch = async (input) => {
+    if (String(input).endsWith("/projects")) {
+      return new Response(JSON.stringify([{ ref, name: "Lonely", status: "ACTIVE_HEALTHY" }]), { status: 200 })
+    }
+    return new Response("not found", { status: 404 })
+  }
+  try {
+    const { addAccount, deleteAccount } = await import("../src/lib/accounts")
+    const { getDb, listProjects } = await import("../src/lib/db")
+    const added = await addAccount("Only", "sbp_token_only_1234567890")
+    const database = getDb()
+    database.prepare(`INSERT INTO ping_runs (id, project_ref, started_at, status, attempt_count, trigger)
+      VALUES (?, ?, ?, 'success', 1, 'manual')`)
+      .run("run-lonely", ref, new Date().toISOString())
+
+    const result = deleteAccount(added.accountId)
+    assert.equal(result.deleted, true)
+    assert.equal(result.rehomed, 0)
+    assert.equal(result.orphaned, 1)
+
+    const project = listProjects().find((candidate) => candidate.ref === ref)
+    assert.ok(project)
+    assert.equal(project.accountId, null)
+    assert.equal(project.accountLabel, "غير مرتبط بحساب")
+    assert.equal(project.enabled, false)
+
+    const run = database.prepare("SELECT COUNT(*) AS count FROM ping_runs WHERE project_ref = ?").get(ref) as { count: number }
+    assert.equal(run.count, 1)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test("token rotation rejects an invalid token and replaces a valid one without losing projects or history", async () => {
+  const originalFetch = globalThis.fetch
+  const ref = "rotatedproject00001"
+  let rejectProjects = false
+  globalThis.fetch = async (input) => {
+    const url = String(input)
+    if (url.endsWith("/projects") && rejectProjects) {
+      return new Response(JSON.stringify({ message: "invalid token" }), { status: 401 })
+    }
+    if (url.endsWith("/projects")) {
+      return new Response(JSON.stringify([{ ref, name: "Rotated", status: "ACTIVE_HEALTHY" }]), { status: 200 })
+    }
+    return new Response("not found", { status: 404 })
+  }
+  try {
+    const { addAccount, rotateAccountToken } = await import("../src/lib/accounts")
+    const { decryptSecret } = await import("../src/lib/crypto")
+    const { getDb, listProjects } = await import("../src/lib/db")
+    const added = await addAccount("Rotate", "sbp_token_old_1234567890")
+    const database = getDb()
+    database.prepare(`INSERT INTO ping_runs (id, project_ref, started_at, status, attempt_count, trigger)
+      VALUES (?, ?, ?, 'success', 1, 'manual')`)
+      .run("run-rotate", ref, new Date().toISOString())
+
+    const storedToken = () => (database.prepare("SELECT encrypted_token FROM accounts WHERE id = ?").get(added.accountId) as { encrypted_token: string }).encrypted_token
+    const before = storedToken()
+
+    rejectProjects = true
+    await assert.rejects(() => rotateAccountToken(added.accountId, "sbp_token_bad_1234567890"))
+    assert.equal(storedToken(), before)
+
+    rejectProjects = false
+    await rotateAccountToken(added.accountId, "sbp_token_new_1234567890")
+
+    assert.equal(decryptSecret(storedToken()), "sbp_token_new_1234567890")
+    const project = listProjects().find((candidate) => candidate.ref === ref)
+    assert.ok(project)
+    assert.equal(project.accountId, added.accountId)
+    const run = database.prepare("SELECT COUNT(*) AS count FROM ping_runs WHERE project_ref = ?").get(ref) as { count: number }
+    assert.equal(run.count, 1)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test("migrates an old-schema database without losing accounts, projects or runs", async () => {
+  const { default: Database } = await import("better-sqlite3")
+  const { migrate } = await import("../src/lib/db")
+  const directory = mkdtempSync(join(tmpdir(), "supaaction-migrate-"))
+  const file = join(directory, "old.db")
+  const database = new Database(file)
+  database.exec(`
+    CREATE TABLE accounts (
+      id TEXT PRIMARY KEY, label TEXT NOT NULL, encrypted_token TEXT NOT NULL, token_hint TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'connected', last_synced_at TEXT, last_error TEXT,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    CREATE TABLE projects (
+      ref TEXT PRIMARY KEY,
+      account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+      name TEXT NOT NULL, organization_id TEXT, organization_slug TEXT, region TEXT,
+      remote_status TEXT NOT NULL DEFAULT 'UNKNOWN', enabled INTEGER NOT NULL DEFAULT 1,
+      last_ping_at TEXT, last_ping_status TEXT, last_latency_ms INTEGER, last_http_status INTEGER, last_error TEXT,
+      next_ping_at TEXT, fail_streak INTEGER NOT NULL DEFAULT 0, last_restore_at TEXT,
+      restore_count INTEGER NOT NULL DEFAULT 0, remote_created_at TEXT,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    CREATE TABLE ping_runs (
+      id TEXT PRIMARY KEY,
+      project_ref TEXT NOT NULL REFERENCES projects(ref) ON DELETE CASCADE,
+      started_at TEXT NOT NULL, completed_at TEXT, status TEXT NOT NULL, latency_ms INTEGER,
+      http_status INTEGER, attempt_count INTEGER NOT NULL DEFAULT 1, error TEXT,
+      trigger TEXT NOT NULL DEFAULT 'scheduled'
+    );
+  `)
+  const now = new Date().toISOString()
+  database.prepare("INSERT INTO accounts (id, label, encrypted_token, token_hint, status, created_at, updated_at) VALUES (?, ?, ?, ?, 'connected', ?, ?)")
+    .run("old-acct", "Old", "v1.iv.tag.ciphertext", "sbp_...", now, now)
+  database.prepare("INSERT INTO projects (ref, account_id, name, remote_status, enabled, fail_streak, restore_count, created_at, updated_at) VALUES (?, ?, ?, 'ACTIVE_HEALTHY', 1, 0, 0, ?, ?)")
+    .run("oldproject000000000", "old-acct", "Old Project", now, now)
+  database.prepare("INSERT INTO ping_runs (id, project_ref, started_at, status, attempt_count, trigger) VALUES (?, ?, ?, 'success', 1, 'manual')")
+    .run("old-run", "oldproject000000000", now)
+  database.close()
+
+  const migrated = new Database(file)
+  migrated.pragma("foreign_keys = ON")
+  migrate(migrated)
+
+  assert.ok(migrated.prepare("SELECT id FROM accounts WHERE id = 'old-acct'").get())
+  const project = migrated.prepare("SELECT ref, account_id, enabled FROM projects WHERE ref = 'oldproject000000000'").get() as { ref: string; account_id: string; enabled: number }
+  assert.deepEqual(project, { ref: "oldproject000000000", account_id: "old-acct", enabled: 1 })
+  const runs = migrated.prepare("SELECT COUNT(*) AS count FROM ping_runs WHERE project_ref = 'oldproject000000000'").get() as { count: number }
+  assert.equal(runs.count, 1)
+
+  const accountLink = (migrated.pragma("foreign_key_list(projects)") as Array<{ from: string; on_delete: string }>).find((foreignKey) => foreignKey.from === "account_id")
+  assert.equal(accountLink?.on_delete, "SET NULL")
+  const accountColumn = (migrated.pragma("table_info(projects)") as Array<{ name: string; notnull: number }>).find((column) => column.name === "account_id")
+  assert.equal(accountColumn?.notnull, 0)
+  const visibility = migrated.prepare("SELECT COUNT(*) AS count FROM project_accounts WHERE project_ref = 'oldproject000000000' AND account_id = 'old-acct'").get() as { count: number }
+  assert.equal(visibility.count, 1)
+  migrated.close()
+  rmSync(directory, { recursive: true, force: true })
+})
+
+test("rotates the encryption key and refuses when a token cannot be decrypted", async () => {
+  const { spawnSync } = await import("node:child_process")
+  const { default: Database } = await import("better-sqlite3")
+  const { decryptSecret, encryptSecret } = await import("../src/lib/crypto")
+  const KEY_A = "key-a-rotation-secret-that-is-long"
+  const KEY_B = "key-b-rotation-secret-that-is-long"
+  const previousKey = process.env.ENCRYPTION_KEY
+  const directory = mkdtempSync(join(tmpdir(), "supaaction-rotate-"))
+  const scriptPath = join(process.cwd(), "scripts", "rotate-encryption-key.mjs")
+
+  process.env.ENCRYPTION_KEY = KEY_A
+  const encryptedA = encryptSecret("sbp_rotate_token_1234567890")
+  const file = join(directory, "rotate.db")
+  const database = new Database(file)
+  database.exec("CREATE TABLE accounts (id TEXT PRIMARY KEY, encrypted_token TEXT NOT NULL)")
+  database.prepare("INSERT INTO accounts (id, encrypted_token) VALUES (?, ?)").run("acct-1", encryptedA)
+  database.close()
+
+  const rotated = spawnSync(process.execPath, [scriptPath], {
+    env: { ...process.env, DATABASE_PATH: file, OLD_ENCRYPTION_KEY: KEY_A, ENCRYPTION_KEY: KEY_B },
+    encoding: "utf8",
+  })
+  assert.equal(rotated.status, 0, rotated.stderr || rotated.stdout)
+
+  process.env.ENCRYPTION_KEY = KEY_B
+  const rotatedDatabase = new Database(file, { readonly: true })
+  const rotatedRow = rotatedDatabase.prepare("SELECT encrypted_token FROM accounts WHERE id = 'acct-1'").get() as { encrypted_token: string }
+  rotatedDatabase.close()
+  assert.equal(decryptSecret(rotatedRow.encrypted_token), "sbp_rotate_token_1234567890")
+
+  process.env.ENCRYPTION_KEY = KEY_A
+  const encryptedGood = encryptSecret("sbp_good_token_1234567890")
+  const refuseFile = join(directory, "refuse.db")
+  const refuseDatabase = new Database(refuseFile)
+  refuseDatabase.exec("CREATE TABLE accounts (id TEXT PRIMARY KEY, encrypted_token TEXT NOT NULL)")
+  refuseDatabase.prepare("INSERT INTO accounts (id, encrypted_token) VALUES (?, ?)").run("good", encryptedGood)
+  refuseDatabase.prepare("INSERT INTO accounts (id, encrypted_token) VALUES (?, ?)").run("bad", "garbage-token")
+  refuseDatabase.close()
+
+  const refused = spawnSync(process.execPath, [scriptPath], {
+    env: { ...process.env, DATABASE_PATH: refuseFile, OLD_ENCRYPTION_KEY: KEY_A, ENCRYPTION_KEY: KEY_B },
+    encoding: "utf8",
+  })
+  assert.notEqual(refused.status, 0)
+
+  process.env.ENCRYPTION_KEY = KEY_A
+  const afterRefusal = new Database(refuseFile, { readonly: true })
+  const goodRow = afterRefusal.prepare("SELECT encrypted_token FROM accounts WHERE id = 'good'").get() as { encrypted_token: string }
+  afterRefusal.close()
+  assert.equal(decryptSecret(goodRow.encrypted_token), "sbp_good_token_1234567890")
+
+  process.env.ENCRYPTION_KEY = previousKey
+  rmSync(directory, { recursive: true, force: true })
+})

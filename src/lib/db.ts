@@ -3,7 +3,7 @@ import path from "node:path"
 import Database from "better-sqlite3"
 import { databasePath } from "@/lib/env"
 import { randomUUID } from "node:crypto"
-import type { AccountRecord, AppSettings, AuditLogRecord, DashboardData, PaginatedResult, PingRunRecord, ProjectRecord } from "@/lib/types"
+import type { AccountDeletionImpact, AccountRecord, AppSettings, AuditLogRecord, DashboardData, PaginatedResult, PingRunRecord, ProjectRecord } from "@/lib/types"
 
 type Db = Database.Database
 
@@ -11,7 +11,34 @@ declare global {
   var __supaactionDb: Db | undefined
 }
 
-function migrate(database: Db) {
+const PROJECT_COLUMNS = "ref, account_id, name, organization_id, organization_slug, region, remote_status, enabled, last_ping_at, last_ping_status, last_latency_ms, last_http_status, last_error, next_ping_at, fail_streak, last_restore_at, restore_count, remote_created_at, created_at, updated_at"
+
+const PROJECTS_TABLE_SQL = `
+  CREATE TABLE IF NOT EXISTS projects (
+    ref TEXT PRIMARY KEY,
+    account_id TEXT REFERENCES accounts(id) ON DELETE SET NULL,
+    name TEXT NOT NULL,
+    organization_id TEXT,
+    organization_slug TEXT,
+    region TEXT,
+    remote_status TEXT NOT NULL DEFAULT 'UNKNOWN',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    last_ping_at TEXT,
+    last_ping_status TEXT,
+    last_latency_ms INTEGER,
+    last_http_status INTEGER,
+    last_error TEXT,
+    next_ping_at TEXT,
+    fail_streak INTEGER NOT NULL DEFAULT 0,
+    last_restore_at TEXT,
+    restore_count INTEGER NOT NULL DEFAULT 0,
+    remote_created_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+`
+
+export function migrate(database: Db) {
   database.exec(`
     CREATE TABLE IF NOT EXISTS accounts (
       id TEXT PRIMARY KEY,
@@ -25,27 +52,12 @@ function migrate(database: Db) {
       updated_at TEXT NOT NULL
     );
 
-    CREATE TABLE IF NOT EXISTS projects (
-      ref TEXT PRIMARY KEY,
+    ${PROJECTS_TABLE_SQL}
+
+    CREATE TABLE IF NOT EXISTS project_accounts (
+      project_ref TEXT NOT NULL REFERENCES projects(ref) ON DELETE CASCADE,
       account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-      name TEXT NOT NULL,
-      organization_id TEXT,
-      organization_slug TEXT,
-      region TEXT,
-      remote_status TEXT NOT NULL DEFAULT 'UNKNOWN',
-      enabled INTEGER NOT NULL DEFAULT 1,
-      last_ping_at TEXT,
-      last_ping_status TEXT,
-      last_latency_ms INTEGER,
-      last_http_status INTEGER,
-      last_error TEXT,
-      next_ping_at TEXT,
-      fail_streak INTEGER NOT NULL DEFAULT 0,
-      last_restore_at TEXT,
-      restore_count INTEGER NOT NULL DEFAULT 0,
-      remote_created_at TEXT,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
+      PRIMARY KEY (project_ref, account_id)
     );
 
     CREATE TABLE IF NOT EXISTS ping_runs (
@@ -106,7 +118,6 @@ function migrate(database: Db) {
       last_heartbeat_at TEXT NOT NULL
     );
 
-    CREATE INDEX IF NOT EXISTS idx_projects_due ON projects(enabled, next_ping_at);
     CREATE INDEX IF NOT EXISTS idx_ping_runs_started ON ping_runs(started_at DESC);
     CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at DESC);
     INSERT OR IGNORE INTO settings (id) VALUES (1);
@@ -122,6 +133,59 @@ function migrate(database: Db) {
   ]
   for (const [name, definition] of addedColumns) {
     if (!projectColumns.has(name)) database.exec(`ALTER TABLE projects ADD COLUMN ${name} ${definition}`)
+  }
+
+  if (projectsAccountLinkNeedsRebuild(database)) rebuildProjectsAccountLink(database)
+
+  database.prepare("INSERT OR IGNORE INTO project_accounts (project_ref, account_id) SELECT ref, account_id FROM projects WHERE account_id IS NOT NULL").run()
+  database.exec("CREATE INDEX IF NOT EXISTS idx_projects_due ON projects(enabled, next_ping_at)")
+}
+
+function projectsAccountLinkNeedsRebuild(database: Db) {
+  const foreignKeys = database.pragma("foreign_key_list(projects)") as Array<{ from: string; on_delete: string }>
+  const accountLink = foreignKeys.find((foreignKey) => foreignKey.from === "account_id")
+  if (!accountLink || accountLink.on_delete.toUpperCase() !== "SET NULL") return true
+  const columns = database.pragma("table_info(projects)") as Array<{ name: string; notnull: number }>
+  const accountColumn = columns.find((column) => column.name === "account_id")
+  return !accountColumn || accountColumn.notnull !== 0
+}
+
+function rebuildProjectsAccountLink(database: Db) {
+  database.pragma("foreign_keys = OFF")
+  try {
+    database.transaction(() => {
+      database.exec(`
+        CREATE TABLE projects_migrated (
+          ref TEXT PRIMARY KEY,
+          account_id TEXT REFERENCES accounts(id) ON DELETE SET NULL,
+          name TEXT NOT NULL,
+          organization_id TEXT,
+          organization_slug TEXT,
+          region TEXT,
+          remote_status TEXT NOT NULL DEFAULT 'UNKNOWN',
+          enabled INTEGER NOT NULL DEFAULT 1,
+          last_ping_at TEXT,
+          last_ping_status TEXT,
+          last_latency_ms INTEGER,
+          last_http_status INTEGER,
+          last_error TEXT,
+          next_ping_at TEXT,
+          fail_streak INTEGER NOT NULL DEFAULT 0,
+          last_restore_at TEXT,
+          restore_count INTEGER NOT NULL DEFAULT 0,
+          remote_created_at TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+
+        INSERT INTO projects_migrated (${PROJECT_COLUMNS}) SELECT ${PROJECT_COLUMNS} FROM projects;
+
+        DROP TABLE projects;
+        ALTER TABLE projects_migrated RENAME TO projects;
+      `)
+    })()
+  } finally {
+    database.pragma("foreign_keys = ON")
   }
 }
 
@@ -139,16 +203,18 @@ export function getDb() {
 }
 
 type ProjectRow = {
-  ref: string; account_id: string; account_label: string; name: string; organization_id: string | null
+  ref: string; account_id: string | null; account_label: string | null; name: string; organization_id: string | null
   organization_slug: string | null; region: string | null; remote_status: string; enabled: number
   last_ping_at: string | null; last_ping_status: ProjectRecord["lastPingStatus"]; last_latency_ms: number | null
   last_http_status: number | null; last_error: string | null; next_ping_at: string | null
   fail_streak: number; last_restore_at: string | null; restore_count: number; created_at: string
 }
 
+const ORPHANED_ACCOUNT_LABEL = "غير مرتبط بحساب"
+
 function mapProject(row: ProjectRow): ProjectRecord {
   return {
-    ref: row.ref, accountId: row.account_id, accountLabel: row.account_label, name: row.name,
+    ref: row.ref, accountId: row.account_id, accountLabel: row.account_label ?? ORPHANED_ACCOUNT_LABEL, name: row.name,
     organizationId: row.organization_id, organizationSlug: row.organization_slug, region: row.region,
     remoteStatus: row.remote_status, enabled: Boolean(row.enabled), lastPingAt: row.last_ping_at,
     lastPingStatus: row.last_ping_status, lastLatencyMs: row.last_latency_ms,
@@ -175,10 +241,26 @@ export function listAccounts(): AccountRecord[] {
 export function listProjects(): ProjectRecord[] {
   const rows = getDb().prepare(`
     SELECT p.*, a.label AS account_label FROM projects p
-    JOIN accounts a ON a.id = p.account_id
+    LEFT JOIN accounts a ON a.id = p.account_id
     ORDER BY p.enabled DESC, p.name COLLATE NOCASE
   `).all() as ProjectRow[]
   return rows.map(mapProject)
+}
+
+export function getAccountDeletionImpact(accountId: string): AccountDeletionImpact {
+  const database = getDb()
+  const projects = database.prepare("SELECT ref FROM projects WHERE account_id = ?").all(accountId) as Array<{ ref: string }>
+  let rehomed = 0
+  let orphaned = 0
+  for (const { ref } of projects) {
+    const survivor = database.prepare("SELECT 1 AS found FROM project_accounts WHERE project_ref = ? AND account_id <> ? LIMIT 1").get(ref, accountId)
+    if (survivor) rehomed += 1
+    else orphaned += 1
+  }
+  const runs = projects.length === 0
+    ? 0
+    : Number((database.prepare(`SELECT COUNT(*) AS count FROM ping_runs WHERE project_ref IN (${projects.map(() => "?").join(", ")})`).get(...projects.map((project) => project.ref)) as { count: number }).count)
+  return { projects: projects.length, runs, rehomed, orphaned }
 }
 
 export function listProjectsPage(page = 1, pageSize = 25, query = ""): PaginatedResult<ProjectRecord> {
@@ -188,13 +270,13 @@ export function listProjectsPage(page = 1, pageSize = 25, query = ""): Paginated
   const where = search ? "WHERE p.name LIKE ? ESCAPE '\\' OR p.ref LIKE ? ESCAPE '\\' OR a.label LIKE ? ESCAPE '\\'" : ""
   const escaped = `%${search.replace(/[\\%_]/g, "\\$&")}%`
   const params = search ? [escaped, escaped, escaped] : []
-  const total = Number((getDb().prepare(`SELECT COUNT(*) AS count FROM projects p JOIN accounts a ON a.id = p.account_id ${where}`)
+  const total = Number((getDb().prepare(`SELECT COUNT(*) AS count FROM projects p LEFT JOIN accounts a ON a.id = p.account_id ${where}`)
     .get(...params) as { count: number }).count)
   const totalPages = Math.max(1, Math.ceil(total / normalizedPageSize))
   const safePage = Math.min(normalizedPage, totalPages)
   const rows = getDb().prepare(`
     SELECT p.*, a.label AS account_label FROM projects p
-    JOIN accounts a ON a.id = p.account_id
+    LEFT JOIN accounts a ON a.id = p.account_id
     ${where}
     ORDER BY p.enabled DESC, p.name COLLATE NOCASE
     LIMIT ? OFFSET ?
@@ -206,12 +288,12 @@ export function listRecentRuns(limit = 50): PingRunRecord[] {
   const rows = getDb().prepare(`
     SELECT r.*, p.name AS project_name, a.label AS account_label
     FROM ping_runs r JOIN projects p ON p.ref = r.project_ref
-    JOIN accounts a ON a.id = p.account_id
+    LEFT JOIN accounts a ON a.id = p.account_id
     ORDER BY r.started_at DESC LIMIT ?
   `).all(limit) as Array<Record<string, string | number | null>>
   return rows.map((row) => ({
     id: String(row.id), projectRef: String(row.project_ref), projectName: String(row.project_name),
-    accountLabel: String(row.account_label), startedAt: String(row.started_at),
+    accountLabel: row.account_label ? String(row.account_label) : ORPHANED_ACCOUNT_LABEL, startedAt: String(row.started_at),
     completedAt: row.completed_at as string | null, status: row.status as PingRunRecord["status"],
     latencyMs: row.latency_ms as number | null, httpStatus: row.http_status as number | null,
     attemptCount: Number(row.attempt_count), error: row.error as string | null,
@@ -223,13 +305,13 @@ export function listProjectRuns(ref: string, limit = 20): PingRunRecord[] {
   const rows = getDb().prepare(`
     SELECT r.*, p.name AS project_name, a.label AS account_label
     FROM ping_runs r JOIN projects p ON p.ref = r.project_ref
-    JOIN accounts a ON a.id = p.account_id
+    LEFT JOIN accounts a ON a.id = p.account_id
     WHERE r.project_ref = ?
     ORDER BY r.started_at DESC LIMIT ?
   `).all(ref, Math.min(100, Math.max(1, limit))) as Array<Record<string, string | number | null>>
   return rows.map((row) => ({
     id: String(row.id), projectRef: String(row.project_ref), projectName: String(row.project_name),
-    accountLabel: String(row.account_label), startedAt: String(row.started_at),
+    accountLabel: row.account_label ? String(row.account_label) : ORPHANED_ACCOUNT_LABEL, startedAt: String(row.started_at),
     completedAt: row.completed_at as string | null, status: row.status as PingRunRecord["status"],
     latencyMs: row.latency_ms as number | null, httpStatus: row.http_status as number | null,
     attemptCount: Number(row.attempt_count), error: row.error as string | null,
@@ -247,12 +329,12 @@ export function listRecentRunsPage(page = 1, pageSize = 50): PaginatedResult<Pin
   const rows = getDb().prepare(`
     SELECT r.*, p.name AS project_name, a.label AS account_label
     FROM ping_runs r JOIN projects p ON p.ref = r.project_ref
-    JOIN accounts a ON a.id = p.account_id
+    LEFT JOIN accounts a ON a.id = p.account_id
     ORDER BY r.started_at DESC LIMIT ? OFFSET ?
   `).all(normalizedPageSize, offset) as Array<Record<string, string | number | null>>
   const items = rows.map((row) => ({
     id: String(row.id), projectRef: String(row.project_ref), projectName: String(row.project_name),
-    accountLabel: String(row.account_label), startedAt: String(row.started_at), completedAt: row.completed_at as string | null,
+    accountLabel: row.account_label ? String(row.account_label) : ORPHANED_ACCOUNT_LABEL, startedAt: String(row.started_at), completedAt: row.completed_at as string | null,
     status: row.status as PingRunRecord["status"], latencyMs: row.latency_ms as number | null,
     httpStatus: row.http_status as number | null, attemptCount: Number(row.attempt_count),
     error: row.error as string | null, trigger: row.trigger as PingRunRecord["trigger"],
