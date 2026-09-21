@@ -1,3 +1,5 @@
+import Link from "next/link"
+import { Users } from "lucide-react"
 import { PageHeading } from "@/components/page-heading"
 import { PingButton } from "@/components/ping-button"
 import { ProjectsTable } from "@/components/projects-table"
@@ -5,19 +7,20 @@ import { PaginationNav } from "@/components/pagination-nav"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
-import { getSettings, listProjectsPage } from "@/lib/db"
+import { getSettings, listAccounts, listProjectsPage } from "@/lib/db"
 
 export const dynamic = "force-dynamic"
 
 export default async function ProjectsPage({ searchParams }: { searchParams: Promise<{ page?: string; q?: string }> }) {
   const params = await searchParams
   const settings = getSettings()
+  const hasAccounts = listAccounts().length > 0
   const query = params.q?.trim() || ""
   const projects = listProjectsPage(Number(params.page) || 1, 25, query)
   return (
     <div className="mx-auto max-w-[1500px]">
-      <PageHeading title="المشاريع" description={`كل المشاريع المتاحة للحسابات المتصلة. التنشيط الافتراضي كل ${settings.pingIntervalHours} ساعة.`} actions={<PingButton />} />
-      <Card className="overflow-hidden">
+      <PageHeading title="المشاريع" description={`كل المشاريع المتاحة للحسابات المتصلة. التنشيط الافتراضي كل ${settings.pingIntervalHours} ساعة.`} actions={hasAccounts ? <PingButton /> : undefined} />
+      {!hasAccounts ? <Card className="py-10 text-center"><CardContent><Users className="mx-auto mb-4 size-10 text-muted-foreground" /><h2 className="text-lg font-semibold">لا توجد حسابات متصلة</h2><p className="mx-auto mt-2 max-w-md text-sm text-muted-foreground">اربط حساب Supabase أولًا ليتم اكتشاف مشاريعه وعرضها هنا.</p><Button className="mt-5" asChild><Link href="/accounts">إضافة حساب</Link></Button></CardContent></Card> : <Card className="overflow-hidden">
         <form className="flex flex-col gap-3 border-b p-4 sm:flex-row" method="get">
           <Input name="q" defaultValue={query} aria-label="البحث في المشاريع" placeholder="ابحث بالاسم أو المعرّف أو الحساب..." className="max-w-md" />
           <Button type="submit" variant="outline">بحث</Button>
@@ -26,7 +29,7 @@ export default async function ProjectsPage({ searchParams }: { searchParams: Pro
         </form>
         <CardContent className="p-0"><ProjectsTable projects={projects.items} timeZone={settings.timezone} /></CardContent>
         <PaginationNav page={projects.page} totalPages={projects.totalPages} path="/projects" query={{ q: query }} />
-      </Card>
+      </Card>}
     </div>
   )
 }

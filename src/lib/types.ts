@@ -84,4 +84,5 @@ export type DashboardData = {
   projects: ProjectRecord[]
   recentRuns: PingRunRecord[]
   settings: AppSettings
+  schedulerHeartbeat: string | null
 }

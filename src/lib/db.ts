@@ -219,6 +219,24 @@ export function listRecentRuns(limit = 50): PingRunRecord[] {
   }))
 }
 
+export function listProjectRuns(ref: string, limit = 20): PingRunRecord[] {
+  const rows = getDb().prepare(`
+    SELECT r.*, p.name AS project_name, a.label AS account_label
+    FROM ping_runs r JOIN projects p ON p.ref = r.project_ref
+    JOIN accounts a ON a.id = p.account_id
+    WHERE r.project_ref = ?
+    ORDER BY r.started_at DESC LIMIT ?
+  `).all(ref, Math.min(100, Math.max(1, limit))) as Array<Record<string, string | number | null>>
+  return rows.map((row) => ({
+    id: String(row.id), projectRef: String(row.project_ref), projectName: String(row.project_name),
+    accountLabel: String(row.account_label), startedAt: String(row.started_at),
+    completedAt: row.completed_at as string | null, status: row.status as PingRunRecord["status"],
+    latencyMs: row.latency_ms as number | null, httpStatus: row.http_status as number | null,
+    attemptCount: Number(row.attempt_count), error: row.error as string | null,
+    trigger: row.trigger as PingRunRecord["trigger"],
+  }))
+}
+
 export function listRecentRunsPage(page = 1, pageSize = 50): PaginatedResult<PingRunRecord> {
   const normalizedPage = Math.max(1, Math.floor(page))
   const normalizedPageSize = Math.min(100, Math.max(1, Math.floor(pageSize)))
@@ -288,6 +306,7 @@ export function getDashboardData(): DashboardData {
     projects,
     recentRuns: listRecentRuns(8),
     settings: getSettings(),
+    schedulerHeartbeat: getServiceHeartbeat("scheduler"),
   }
 }
 

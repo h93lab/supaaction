@@ -112,7 +112,7 @@ test("discovers projects and executes a read-only database ping", async () => {
 
   try {
     const { addAccount } = await import("../src/lib/accounts")
-    const { listProjects, listProjectsPage, listRecentRuns, listRecentRunsPage } = await import("../src/lib/db")
+    const { listProjectRuns, listProjects, listProjectsPage, listRecentRuns, listRecentRunsPage } = await import("../src/lib/db")
     const { pingProjects } = await import("../src/lib/pinger")
     const added = await addAccount("Demo account", "sbp_example_token_1234567890")
     assert.equal(added.projectCount, 1)
@@ -122,12 +122,33 @@ test("discovers projects and executes a read-only database ping", async () => {
     const results = await pingProjects(undefined, "manual")
     assert.equal(results[0].status, "success")
     assert.equal(listRecentRuns(1)[0].httpStatus, 201)
+    assert.equal(listProjectRuns("abcdefghijklmnopqrst")[0].httpStatus, 201)
+    assert.deepEqual(listProjectRuns("missing-project"), [])
     assert.equal(listRecentRunsPage(1, 1).total, 1)
     assert.equal(calls.some((call) => call.url.endsWith("/projects") && call.method === "GET"), true)
     assert.equal(calls.some((call) => call.url.includes("/database/query/read-only") && call.method === "POST"), true)
   } finally {
     globalThis.fetch = originalFetch
   }
+})
+
+test("prioritizes dashboard danger and warning health states", async () => {
+  const { getHealthState } = await import("../src/components/health-banner")
+  const project = {
+    ref: "health-project", accountId: "account", accountLabel: "Account", name: "Health",
+    organizationId: null, organizationSlug: null, region: null, remoteStatus: "ACTIVE_HEALTHY",
+    enabled: true, lastPingAt: null, lastPingStatus: "success" as const, lastLatencyMs: null,
+    lastHttpStatus: null, lastError: null, nextPingAt: null, failStreak: 0, lastRestoreAt: null,
+    restoreCount: 0, createdAt: new Date().toISOString(),
+  }
+  const now = Date.now()
+  assert.equal(getHealthState([project], new Date(now).toISOString(), now).state, "healthy")
+  assert.equal(getHealthState([{ ...project, failStreak: 1 }], new Date(now).toISOString(), now).state, "warning")
+  const stale = getHealthState([project], new Date(now - 11 * 60 * 1000).toISOString(), now)
+  assert.equal(stale.state, "warning")
+  assert.deepEqual(stale.affected, [project])
+  assert.equal(getHealthState([{ ...project, remoteStatus: "INACTIVE" }], null, now).state, "danger")
+  assert.equal(getHealthState([{ ...project, failStreak: 3 }], new Date(now).toISOString(), now).state, "danger")
 })
 
 test("does not retry a paused-project response", async () => {
