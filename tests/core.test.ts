@@ -225,6 +225,114 @@ test("restores a paused project once per cooldown window", async () => {
   }
 })
 
+test("contains an undecryptable token to its own project and still pings the rest", async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async (input) => {
+    const url = String(input)
+    if (url.includes("/database/query/read-only")) return new Response(JSON.stringify([{ supaaction_ping: 1 }]), { status: 201 })
+    return new Response("not found", { status: 404 })
+  }
+  const badRef = "badtokenproject001"
+  const goodRef = "goodtokenproject001"
+  try {
+    await seedProject(badRef, "ACTIVE_HEALTHY")
+    await seedProject(goodRef, "ACTIVE_HEALTHY")
+    const { getDb } = await import("../src/lib/db")
+    getDb().prepare("UPDATE accounts SET encrypted_token = ? WHERE id = ?").run("corrupted-token", `acct-${badRef}`)
+
+    const { pingProjects } = await import("../src/lib/pinger")
+    const results = await pingProjects([badRef, goodRef], "manual")
+    assert.equal(results.length, 2)
+
+    const database = getDb()
+    const badRun = database.prepare("SELECT COUNT(*) AS count FROM ping_runs WHERE project_ref = ?").get(badRef) as { count: number }
+    const goodRun = database.prepare("SELECT COUNT(*) AS count FROM ping_runs WHERE project_ref = ?").get(goodRef) as { count: number }
+    assert.equal(badRun.count, 1)
+    assert.equal(goodRun.count, 1)
+
+    const badProject = database.prepare("SELECT next_ping_at, last_ping_status, last_error FROM projects WHERE ref = ?")
+      .get(badRef) as { next_ping_at: string; last_ping_status: string; last_error: string }
+    const goodProject = database.prepare("SELECT last_ping_status FROM projects WHERE ref = ?")
+      .get(goodRef) as { last_ping_status: string }
+    assert.equal(badProject.last_ping_status, "failed")
+    assert.ok(Date.parse(badProject.next_ping_at) > Date.now())
+    assert.equal(badProject.last_error, "Account token is unavailable or could not be decrypted")
+    assert.equal(badProject.last_error.includes("corrupted-token"), false)
+    assert.equal(goodProject.last_ping_status, "success")
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test("refreshes the ping-sweep marker when the sweep completes", async () => {
+  const { getDb } = await import("../src/lib/db")
+  getDb().prepare("DELETE FROM service_status WHERE name = ?").run("ping-sweep")
+  getDb().prepare("UPDATE projects SET next_ping_at = ?").run(new Date(Date.now() + 3_600_000).toISOString())
+  const { runPingSweep } = await import("../src/lib/scheduler")
+  await runPingSweep()
+  const { getServiceHeartbeat } = await import("../src/lib/db")
+  assert.equal(typeof getServiceHeartbeat("ping-sweep"), "string")
+})
+
+test("does not refresh the ping-sweep marker when the sweep throws", async () => {
+  const { getDb } = await import("../src/lib/db")
+  getDb().prepare("DELETE FROM service_status WHERE name = ?").run("ping-sweep")
+  const { runPingSweep } = await import("../src/lib/scheduler")
+  await assert.rejects(() => runPingSweep(() => Promise.reject(new Error("sweep failed"))), /sweep failed/)
+  const { getServiceHeartbeat } = await import("../src/lib/db")
+  assert.equal(getServiceHeartbeat("ping-sweep"), null)
+})
+
+test("a retryable restore failure leaves the restore cooldown untouched", async () => {
+  const originalFetch = globalThis.fetch
+  const ref = "retryablerestore01"
+  globalThis.fetch = async (input, init) => {
+    const url = String(input)
+    const method = init?.method || "GET"
+    if (url.endsWith("/restore")) return new Response(JSON.stringify({ message: "Server error" }), { status: 500 })
+    if (method === "GET") return new Response(JSON.stringify({ ref, name: ref, status: "PAUSED" }), { status: 200 })
+    return new Response("not found", { status: 404 })
+  }
+  try {
+    await seedProject(ref, "PAUSED")
+    const { pingProjects } = await import("../src/lib/pinger")
+    const { getDb } = await import("../src/lib/db")
+    await pingProjects([ref], "manual")
+    const row = getDb().prepare("SELECT last_restore_at, restore_count, last_error FROM projects WHERE ref = ?")
+      .get(ref) as { last_restore_at: string | null; restore_count: number; last_error: string }
+    assert.equal(row.last_restore_at, null)
+    assert.equal(row.restore_count, 0)
+    assert.match(row.last_error, /Server error/)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test("a forbidden restore failure starts the cooldown and records an Arabic reason", async () => {
+  const originalFetch = globalThis.fetch
+  const ref = "forbiddenrestore01"
+  globalThis.fetch = async (input, init) => {
+    const url = String(input)
+    const method = init?.method || "GET"
+    if (url.endsWith("/restore")) return new Response(JSON.stringify({ message: "Forbidden" }), { status: 403 })
+    if (method === "GET") return new Response(JSON.stringify({ ref, name: ref, status: "PAUSED" }), { status: 200 })
+    return new Response("not found", { status: 404 })
+  }
+  try {
+    await seedProject(ref, "PAUSED")
+    const { pingProjects, RESTORE_FORBIDDEN_REASON } = await import("../src/lib/pinger")
+    const { getDb } = await import("../src/lib/db")
+    await pingProjects([ref], "manual")
+    const row = getDb().prepare("SELECT last_restore_at, restore_count, last_error FROM projects WHERE ref = ?")
+      .get(ref) as { last_restore_at: string | null; restore_count: number; last_error: string }
+    assert.equal(typeof row.last_restore_at, "string")
+    assert.equal(row.restore_count, 1)
+    assert.equal(row.last_error, RESTORE_FORBIDDEN_REASON)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
 test("parses the Retry-After header from seconds, HTTP dates and garbage", async () => {
   const { parseRetryAfter } = await import("../src/lib/supabase-management")
   assert.equal(parseRetryAfter("30"), 30)

@@ -35,6 +35,11 @@ function maybeRunRetentionCleanup() {
   updateServiceHeartbeat(CLEANUP_MARKER)
 }
 
+export async function runPingSweep(sweep: () => Promise<unknown> = runDuePings) {
+  await sweep()
+  updateServiceHeartbeat("ping-sweep")
+}
+
 export function startScheduler() {
   if (globalThis.__supaactionSchedulerStarted) return
   globalThis.__supaactionSchedulerStarted = true
@@ -44,7 +49,7 @@ export function startScheduler() {
   cron.schedule("* * * * *", async () => {
     try {
       await maybeSyncAccounts()
-      await runDuePings()
+      await runPingSweep()
       maybeRunRetentionCleanup()
     } catch (error) {
       console.error("[scheduler] tick failed", error)

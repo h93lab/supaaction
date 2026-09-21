@@ -20,6 +20,14 @@ const PAUSED_STATUSES = new Set(["INACTIVE", "PAUSED", "PAUSING", "INACTIVE_HEAL
 const RESTORE_COOLDOWN_HOURS = 6
 const PAUSED_RECHECK_MINUTES = 30
 
+export const RESTORE_FORBIDDEN_REASON = "تعذّر إعادة تشغيل المشروع: رمز الوصول لا يملك صلاحية الكتابة المطلوبة"
+export const RESTORE_QUOTA_REASON = "تعذّر إعادة تشغيل المشروع: تم بلوغ الحد الأقصى للمشاريع النشطة في الباقة المجانية"
+
+function permanentRestoreReason(status: number | null) {
+  if (status === 401 || status === 403) return RESTORE_FORBIDDEN_REASON
+  return RESTORE_QUOTA_REASON
+}
+
 export function failureBackoffMinutes(failStreak: number): number {
   if (failStreak <= 0) return 0
   if (failStreak === 1) return 15
@@ -36,11 +44,17 @@ export async function pingOneProject(target: PingTarget, trigger: PingRunRecord[
   const settings = getSettings()
   const startedAt = new Date().toISOString()
   const runId = randomUUID()
-  const token = getAccountToken(target.account_id)
+  let token: string | null = null
   let finalError: Error | null = null
   let httpStatus: number | null = null
   let attempts = 0
   const started = performance.now()
+
+  try {
+    token = getAccountToken(target.account_id)
+  } catch {
+    finalError = new Error("Account token is unavailable or could not be decrypted")
+  }
 
   const storedFailStreak = target.fail_streak ?? 0
   let failStreak = storedFailStreak
@@ -49,7 +63,7 @@ export async function pingOneProject(target: PingTarget, trigger: PingRunRecord[
   let remoteStatus = target.remote_status ?? "UNKNOWN"
   let pausedFromStatus = isPausedStatus(remoteStatus)
 
-  if (pausedFromStatus) {
+  if (token !== null && pausedFromStatus) {
     try {
       const refreshed = await fetchProject(token, target.ref, settings.requestTimeoutSeconds)
       if (refreshed.data?.status) {
@@ -61,7 +75,7 @@ export async function pingOneProject(target: PingTarget, trigger: PingRunRecord[
     }
   }
 
-  if (!pausedFromStatus) {
+  if (token !== null && !pausedFromStatus) {
     for (let attempt = 0; attempt <= settings.retryCount; attempt += 1) {
       attempts = attempt + 1
       try {
@@ -103,16 +117,15 @@ export async function pingOneProject(target: PingTarget, trigger: PingRunRecord[
     nextPingAt = new Date(Date.now() + backoffMinutes * 60 * 1000).toISOString()
   }
 
-  if (paused) {
+  if (paused && token !== null) {
     const cooldownMs = RESTORE_COOLDOWN_HOURS * 60 * 60 * 1000
     const lastRestoreTime = lastRestoreAt ? Date.parse(lastRestoreAt) : Number.NaN
     const cooldownElapsed = Number.isNaN(lastRestoreTime) || Date.now() - lastRestoreTime >= cooldownMs
     if (cooldownElapsed) {
-      const attemptedAt = new Date().toISOString()
-      lastRestoreAt = attemptedAt
-      restoreCount += 1
       try {
         await restoreProject(token, target.ref, settings.requestTimeoutSeconds)
+        lastRestoreAt = new Date().toISOString()
+        restoreCount += 1
         recordAudit("project.restore", "project", target.ref, `Restore requested for ${target.name} (${target.ref})`)
         try {
           const refreshed = await fetchProject(token, target.ref, settings.requestTimeoutSeconds)
@@ -122,8 +135,16 @@ export async function pingOneProject(target: PingTarget, trigger: PingRunRecord[
         }
         errorMessage = null
       } catch (error) {
-        errorMessage = error instanceof Error ? error.message : "Restore failed"
-        recordAudit("project.restore_failed", "project", target.ref, `Restore failed for ${target.name} (${target.ref}): ${errorMessage}`)
+        const retryable = !(error instanceof SupabaseApiError) || error.retryable
+        if (retryable) {
+          errorMessage = error instanceof Error ? error.message : "Restore failed"
+          recordAudit("project.restore_failed", "project", target.ref, `Restore failed for ${target.name} (${target.ref}): ${errorMessage}`)
+        } else {
+          lastRestoreAt = new Date().toISOString()
+          restoreCount += 1
+          errorMessage = permanentRestoreReason(error instanceof SupabaseApiError ? error.status : null)
+          recordAudit("project.restore_failed", "project", target.ref, `Restore failed for ${target.name} (${target.ref}): ${errorMessage}`)
+        }
       }
     }
   }
@@ -150,7 +171,11 @@ async function withConcurrency<T, R>(items: T[], concurrency: number, worker: (i
   async function runner() {
     while (cursor < items.length) {
       const index = cursor++
-      results[index] = await worker(items[index])
+      try {
+        results[index] = await worker(items[index])
+      } catch (error) {
+        console.error("[pinger] worker failed", error)
+      }
     }
   }
   await Promise.all(Array.from({ length: Math.min(Math.max(concurrency, 1), items.length) }, runner))
