@@ -132,7 +132,7 @@ test("discovers projects and executes a read-only database ping", async () => {
   }
 })
 
-test("prioritizes dashboard danger and warning health states", async () => {
+test("reports every dashboard health problem without alarming on intentionally disabled projects", async () => {
   const { getHealthState } = await import("../src/components/health-banner")
   const project = {
     ref: "health-project", accountId: "account", accountLabel: "Account", name: "Health",
@@ -142,13 +142,55 @@ test("prioritizes dashboard danger and warning health states", async () => {
     restoreCount: 0, createdAt: new Date().toISOString(),
   }
   const now = Date.now()
-  assert.equal(getHealthState([project], new Date(now).toISOString(), now).state, "healthy")
-  assert.equal(getHealthState([{ ...project, failStreak: 1 }], new Date(now).toISOString(), now).state, "warning")
-  const stale = getHealthState([project], new Date(now - 11 * 60 * 1000).toISOString(), now)
-  assert.equal(stale.state, "warning")
-  assert.deepEqual(stale.affected, [project])
-  assert.equal(getHealthState([{ ...project, remoteStatus: "INACTIVE" }], null, now).state, "danger")
-  assert.equal(getHealthState([{ ...project, failStreak: 3 }], new Date(now).toISOString(), now).state, "danger")
+  const fresh = new Date(now).toISOString()
+  const healthyInputs = {
+    projects: [project], accountErrors: [], schedulerHeartbeat: fresh,
+    pingSweepHeartbeat: fresh, lastSuccessfulPingAt: new Date(now - 3 * 60 * 60 * 1000).toISOString(),
+  }
+
+  const healthy = getHealthState(healthyInputs, now)
+  assert.equal(healthy.state, "healthy")
+  assert.deepEqual(healthy.problems, [])
+  assert.match(healthy.lastSuccess, /منذ ٣ ساعات/)
+
+  const accountError = getHealthState({
+    ...healthyInputs,
+    accountErrors: [{ label: "حساب الإنتاج", message: "انتهت صلاحية الرمز" }],
+  }, now)
+  assert.equal(accountError.state, "danger")
+  assert.match(accountError.problems.join(" "), /حساب الإنتاج/)
+
+  const staleSweep = getHealthState({
+    ...healthyInputs,
+    pingSweepHeartbeat: new Date(now - 11 * 60 * 1000).toISOString(),
+  }, now)
+  assert.equal(staleSweep.state, "danger")
+  assert.match(staleSweep.problems.join(" "), /توقفت دورة تنشيط المشاريع/)
+
+  const pausedAndStale = getHealthState({
+    ...healthyInputs,
+    projects: [{ ...project, remoteStatus: "PAUSED" }],
+    schedulerHeartbeat: new Date(now - 11 * 60 * 1000).toISOString(),
+  }, now)
+  assert.equal(pausedAndStale.state, "danger")
+  assert.equal(pausedAndStale.problems.some((problem) => problem.includes("مشاريع متوقفة")), true)
+  assert.equal(pausedAndStale.problems.some((problem) => problem.includes("نبضة المجدول")), true)
+
+  const disabled = getHealthState({
+    ...healthyInputs,
+    projects: [{ ...project, enabled: false, remoteStatus: "PAUSED", failStreak: 4 }],
+  }, now)
+  assert.equal(disabled.state, "healthy")
+
+  const orphaned = getHealthState({
+    ...healthyInputs,
+    projects: [{ ...project, accountId: null, enabled: false }],
+  }, now)
+  assert.equal(orphaned.state, "danger")
+  assert.match(orphaned.problems.join(" "), /Health/)
+
+  assert.equal(getHealthState({ ...healthyInputs, pingSweepHeartbeat: null }, now).state, "healthy")
+  assert.match(getHealthState({ ...healthyInputs, lastSuccessfulPingAt: null }, now).lastSuccess, /لم يُسجّل/)
 })
 
 test("does not retry a paused-project response", async () => {

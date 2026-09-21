@@ -378,9 +378,15 @@ export function getSettings(): AppSettings {
 
 export function getDashboardData(): DashboardData {
   const projects = listProjects()
+  const accounts = listAccounts()
+  const lastSuccessfulPing = getDb().prepare(`
+    SELECT MAX(r.completed_at) AS completed_at
+    FROM ping_runs r JOIN projects p ON p.ref = r.project_ref
+    WHERE p.enabled = 1 AND r.status = 'success'
+  `).get() as { completed_at: string | null }
   return {
     totals: {
-      accounts: listAccounts().length,
+      accounts: accounts.length,
       projects: projects.length,
       protected: projects.filter((project) => project.enabled && project.lastPingStatus !== "failed").length,
       failed: projects.filter((project) => project.lastPingStatus === "failed").length,
@@ -388,7 +394,12 @@ export function getDashboardData(): DashboardData {
     projects,
     recentRuns: listRecentRuns(8),
     settings: getSettings(),
+    accountErrors: accounts
+      .filter((account) => account.status === "error")
+      .map((account) => ({ label: account.label, message: account.lastError || "خطأ غير معروف" })),
     schedulerHeartbeat: getServiceHeartbeat("scheduler"),
+    pingSweepHeartbeat: getServiceHeartbeat("ping-sweep"),
+    lastSuccessfulPingAt: lastSuccessfulPing.completed_at,
   }
 }
 

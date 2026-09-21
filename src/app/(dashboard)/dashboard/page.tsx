@@ -24,12 +24,18 @@ export default function DashboardPage() {
   return (
     <div className="mx-auto max-w-[1500px]">
       <PageHeading title="نظرة عامة" description="تابع حالة كل مشاريعك وعمليات التنشيط المجدولة." actions={<><Button variant="outline" asChild><Link href="/accounts">إدارة الحسابات</Link></Button>{data.totals.projects > 0 && <PingButton />}</>} />
-      {!data.totals.accounts ? (
+      {!data.totals.accounts && !data.totals.projects ? (
         <Card className="py-10 text-center">
           <CardContent><Users className="mx-auto mb-4 size-10 text-muted-foreground" /><h2 className="text-lg font-semibold">ابدأ بربط حساب Supabase</h2><p className="mx-auto mt-2 max-w-md text-sm text-muted-foreground">لا توجد حسابات متصلة بعد. أضف حسابًا لاكتشاف المشاريع وحمايتها تلقائيًا.</p><Button className="mt-5" asChild><Link href="/accounts">إضافة حساب</Link></Button></CardContent>
         </Card>
       ) : <>
-        <HealthBanner projects={data.projects} schedulerHeartbeat={data.schedulerHeartbeat} />
+        <HealthBanner
+          projects={data.projects}
+          accountErrors={data.accountErrors}
+          schedulerHeartbeat={data.schedulerHeartbeat}
+          pingSweepHeartbeat={data.pingSweepHeartbeat}
+          lastSuccessfulPingAt={data.lastSuccessfulPingAt}
+        />
         <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">{stats.map((stat) => <Card key={stat.title}><CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2"><CardTitle className="text-sm font-medium text-muted-foreground">{stat.title}</CardTitle><stat.icon className="size-4 text-muted-foreground" /></CardHeader><CardContent><div className="text-3xl font-semibold tracking-tight">{stat.value}</div><p className="mt-1 text-xs text-muted-foreground">{stat.note}</p></CardContent></Card>)}</div>
         <div className="mt-6 grid gap-6 xl:grid-cols-[minmax(0,1.7fr)_minmax(320px,.7fr)]">
           <Card className="overflow-hidden"><CardHeader className="flex flex-row items-center justify-between"><div><CardTitle>حالة المشاريع</CardTitle><CardDescription>آخر نتيجة للمشاريع المكتشفة</CardDescription></div><Button variant="outline" size="sm" asChild><Link href="/projects">عرض الكل</Link></Button></CardHeader><CardContent className="p-0"><ProjectsTable projects={data.projects} timeZone={data.settings.timezone} compact /></CardContent></Card>
