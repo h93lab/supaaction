@@ -34,7 +34,11 @@ services:
     cap_drop:
       - ALL
     healthcheck:
-      disable: true
+      test: ["CMD", "node", "scripts/worker-health.mjs"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
 
 volumes:
   supaaction-data:
